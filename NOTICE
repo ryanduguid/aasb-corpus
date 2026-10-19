@@ -1,0 +1,11 @@
+aasb-corpus
+Copyright 2026 Ryan Duguid
+
+This product includes adapted code and regression cases from
+au-tax-legislation-corpus, Copyright 2026 Ryan Duguid
+(https://github.com/ryanduguid/au-tax-legislation-corpus).
+Inspected upstream revision: 84db0481a924f07d3f697f54a269917475613184.
+
+Modified on 15 October 2026: quotation matching was ported to Rust;
+the extraction completeness invariant was adapted to PDF page coverage.
+The Apache-2.0 code licence does not license the source standards.
