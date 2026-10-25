@@ -608,7 +608,8 @@ mod tests {
             .join("target/test-data")
             .join(format!("{}-{unique}", std::process::id()));
         fs::create_dir_all(root.join("source")).unwrap();
-        let content = b"Fabricated source bytes for an index contract test";
+        let content =
+            b"Fabricated source bytes from the Croft Manor library for an index contract test";
         let sha = hash(content);
         fs::write(root.join("source/sample.pdf"), content).unwrap();
         let sources = json!({"files":[{"filename":"sample.pdf","source_url":"https://example.invalid/sample.pdf","sha256":sha,"page_count":1}]});
