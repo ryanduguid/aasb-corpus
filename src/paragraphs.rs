@@ -257,6 +257,74 @@ pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
     )
 }
 
+fn tokens(text: &str) -> Vec<String> {
+    crate::literal(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// True when every word of `fragment` appears in `reading` in the same order, not
+/// necessarily adjacent. Case is kept; markup, punctuation and spacing are ignored because
+/// readers split words differently (for example at kerning gaps or line-end hyphens).
+fn in_order(fragment: &str, reading: &str) -> bool {
+    let reading = tokens(reading).concat();
+    let mut position = 0;
+    tokens(fragment)
+        .iter()
+        .all(|word| match reading[position..].find(word.as_str()) {
+            Some(offset) => {
+                position += offset + word.len();
+                true
+            }
+            None => false,
+        })
+}
+
+/// Confirms a `found` paragraph against an independent reading of the same PDF pages.
+/// Without that reading the status becomes `found_unconfirmed`; a mismatch needs review.
+pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)>) {
+    if result["status"] != "found" {
+        result["second_reader"] = json!({"status":"not_checked"});
+        return;
+    }
+    let Some((reader, pages)) = reading else {
+        result["status"] = json!("found_unconfirmed");
+        result["second_reader"] = json!({"status":"unavailable"});
+        return;
+    };
+    let candidate = &mut result["candidates"][0];
+    let mut unconfirmed: Vec<u64> = candidate["fragments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|fragment| {
+            let text = fragment["text"].as_str().unwrap_or_default();
+            let page = fragment["pdf_page"].as_u64().unwrap_or(0) as usize;
+            !page
+                .checked_sub(1)
+                .and_then(|index| pages.get(index))
+                .is_some_and(|reading| in_order(text, reading))
+        })
+        .filter_map(|fragment| fragment["pdf_page"].as_u64())
+        .collect();
+    unconfirmed.dedup();
+    if unconfirmed.is_empty() {
+        result["second_reader"] = json!({"status":"confirmed","reader":reader});
+        return;
+    }
+    candidate["needs_review"] = json!(true);
+    if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
+        reasons.push(json!(
+            "A second reader did not confirm the fragment's words in order on its page."
+        ));
+    }
+    result["status"] = json!("needs_review");
+    result["second_reader"] =
+        json!({"status":"mismatch","reader":reader,"unconfirmed_pages":unconfirmed});
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +335,53 @@ mod tests {
             provenance: "native".into(),
             needs_review: false,
         }
+    }
+
+    #[test]
+    fn second_reader_words_must_appear_in_order_on_the_page() {
+        let fragment = "**35** A fabricated re-\nquirement applies.";
+        assert!(in_order(
+            fragment,
+            "Header\n35 A fabri cated requirement\napplies. 36"
+        ));
+        assert!(!in_order(fragment, "35 A fabricated requirement."));
+        assert!(!in_order(fragment, "35 A requirement applies fabricated."));
+        assert!(!in_order(fragment, "35 a fabricated requirement applies."));
+    }
+
+    #[test]
+    fn found_paragraphs_need_an_independent_reading_of_their_pages() {
+        let pages = [page(
+            1,
+            "35 A fabricated requirement.\n36 Next requirement.",
+        )];
+        let checked = |reading: Option<&(String, Vec<String>)>| {
+            let mut result = lookup(&pages, "35").unwrap();
+            assert_eq!(result["status"], "found");
+            confirm(&mut result, reading);
+            result
+        };
+        let reader = |text: &str| ("fabricated 1".to_owned(), vec![text.to_owned()]);
+        let confirmed = checked(Some(&reader("35 A fabricated requirement. 36 Next")));
+        assert_eq!(confirmed["status"], "found");
+        assert_eq!(confirmed["second_reader"]["status"], "confirmed");
+        assert_eq!(confirmed["second_reader"]["reader"], "fabricated 1");
+        let mismatch = checked(Some(&reader("35 A requirement. 36 Next")));
+        assert_eq!(mismatch["status"], "needs_review");
+        assert_eq!(mismatch["second_reader"]["status"], "mismatch");
+        assert_eq!(mismatch["second_reader"]["unconfirmed_pages"], json!([1]));
+        assert_eq!(mismatch["candidates"][0]["needs_review"], true);
+        let missing_page = checked(Some(&("fabricated 1".to_owned(), vec![])));
+        assert_eq!(missing_page["status"], "needs_review");
+        let unavailable = checked(None);
+        assert_eq!(unavailable["status"], "found_unconfirmed");
+        assert_eq!(unavailable["second_reader"]["status"], "unavailable");
+        let repeated = [pages[0].text.as_str(), "35 Again.\n36 Next."];
+        let repeated: Vec<_> = (1..).zip(repeated).map(|(n, t)| page(n, t)).collect();
+        let mut ambiguous = lookup(&repeated, "35").unwrap();
+        confirm(&mut ambiguous, None);
+        assert_eq!(ambiguous["status"], "ambiguous");
+        assert_eq!(ambiguous["second_reader"]["status"], "not_checked");
     }
 
     #[test]

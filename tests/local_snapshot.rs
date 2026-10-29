@@ -131,7 +131,10 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
             paragraphs += 1;
         }
     }
-    assert!(statuses.get("found").copied().unwrap_or(0) > 0);
+    assert!(
+        statuses.get("found").copied().unwrap_or(0) > 0,
+        "no confirmed paragraphs; run tools/second_reader.py on the snapshot"
+    );
     println!(
         "local snapshot: {} distinct paginated AASB 15 pages; {paragraphs} paragraph lookups; {spans} exact page spans; statuses={statuses:?}",
         all.len()

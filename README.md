@@ -2,7 +2,7 @@
 
 Extract local AASB PDFs into page records and search them through a Rust CLI and SQLite FTS5 index. Results retain the source PDF hash, physical PDF page number, original URL and catalogue version metadata. The corpus is a finding aid; selecting an applicable reporting framework or version remains a separate review.
 
-The installed pdf-inspector exposes its extraction and offline OCR through Python, so `tools/extract.py` is the native extraction bridge. Indexing, search, page lookup, quotation checks and verification are Rust. No command uploads documents, calls a model provider or downloads content.
+The installed pdf-inspector exposes its extraction and offline OCR through Python, so `tools/extract.py` is the native extraction bridge. `tools/second_reader.py` reads the same PDFs with pypdf, already installed in that environment, to confirm paragraph lookups without a new dependency. Indexing, search, page lookup, quotation checks and verification are Rust. No command uploads documents, calls a model provider or downloads content.
 
 ## Current local snapshot
 
@@ -62,10 +62,13 @@ Supply an exact PDF hash and a label such as `35`, `B19`, `Aus25.1` or `BC1`. Re
 
 The result retains document metadata and candidate fragments with physical PDF pages, one-based inclusive line spans, page-text hashes, native/OCR provenance and review flags. Each fragment is an unchanged slice of the indexed page. Continuations can span multiple pages; recognised page footers are excluded. Recognised `Corresponding AASB Standard` footnotes are returned separately from the paragraph text.
 
-- `found` means one candidate has native text and an ending confirmed by an adjacent paragraph label.
+- `found` means one candidate has native text and an ending confirmed by an adjacent paragraph label, and a second reader confirms it (below).
+- `found_unconfirmed` meets the other `found` conditions, but the selected PDF has no second reading.
 - `ambiguous` preserves repeated occurrences for review, including possible examples or amendments.
 - `needs_review` identifies uncertain endings, headings that interrupt unanchored content, page gaps, tables or OCR/review flags.
 - `not_found` means no supported extracted line anchor was found. It does not establish that the PDF lacks the paragraph.
+
+The second reader is pypdf, a PDF parser independent of pdf-inspector that is installed in the same environment. `tools/second_reader.py` stores its text for every page in `second-reader/`, with per-document digests. Before reporting `found`, lookup checks that each fragment's words appear in the same order in pypdf's text of the same physical page; adjacency, spacing, punctuation and markup are ignored, case is not. A mismatch reports `needs_review` with a review reason. `second_reader` records `confirmed`, `mismatch` (with `unconfirmed_pages`), `unavailable` or `not_checked`, plus the reader and its version. A changed or incomplete second reading is an error.
 
 Only treat `found` as a located source span; the accounting conclusion remains separate. Lookup excludes recognised contents pages, bounds output to 20 candidates and withholds candidate text above 64 KiB while preserving page references. Unsupported layouts require reading the cited PDF pages. No general PDF-layout accuracy is claimed.
 
@@ -97,10 +100,13 @@ Copy the authorised PDFs, download manifest and catalogue into a new snapshot wi
 
 ```powershell
 & 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 tools/extract.py 'C:\path\to\new-snapshot'
+& 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 tools/second_reader.py 'C:\path\to\new-snapshot'
 & .\target\release\aasb-corpus.exe build 'C:\path\to\new-snapshot'
 ```
 
 On the Linux sandbox, use `agent-run pdf-inspector-python tools/extract.py SNAPSHOT`. The extractor verifies source hashes, checks every page index, uses offline OCR only where pdf-inspector requests it and retains review flags. It stages extraction before renaming the completed folder. Indexing checks input hashes and complete document/page coverage, builds and checks FTS5 in one transaction, then promotes a new index. Failed stages are retained for inspection and never replace a completed snapshot.
+
+`tools/second_reader.py` also verifies source hashes and page coverage and stages its output. It adds `second-reader/` to an existing snapshot without changing the index, and refuses an existing output folder. A PDF that pypdf cannot read is listed under `failures` in its manifest, and its paragraphs report `found_unconfirmed`.
 
 ## Checks
 

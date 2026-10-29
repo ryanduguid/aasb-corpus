@@ -494,7 +494,55 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     )
 }
 
-fn paragraph(connection: &Connection, sha: &str, label: &str) -> Result<Value> {
+#[derive(Deserialize)]
+struct SecondReader {
+    reader: String,
+    reader_version: String,
+    documents: Vec<Document>,
+}
+#[derive(Deserialize)]
+struct Reading {
+    page: u32,
+    text: String,
+}
+
+/// Loads one PDF's independent page texts from `tools/second_reader.py`, or `None` when
+/// that PDF has no second reading. Changed or incomplete readings are errors.
+fn second_reading(
+    root: &Path,
+    sha: &str,
+    page_count: usize,
+) -> Result<Option<(String, Vec<String>)>> {
+    let folder = root.join("second-reader");
+    if !folder.join("manifest.json").exists() {
+        return Ok(None);
+    }
+    let manifest: SecondReader = read_json(&folder.join("manifest.json"))?;
+    let Some(document) = manifest.documents.iter().find(|d| d.sha256 == sha) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(folder.join(sha).join("pages.jsonl"))?;
+    if hash(&bytes) != document.pages_sha256 {
+        return Err("second-reader pages changed".into());
+    }
+    let mut pages = Vec::new();
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        let reading: Reading = serde_json::from_str(line)?;
+        if reading.page as usize != pages.len() + 1 {
+            return Err("second reading has a missing, duplicated or reordered page".into());
+        }
+        pages.push(reading.text);
+    }
+    if pages.len() != page_count || document.page_count as usize != page_count {
+        return Err("second-reader page coverage differs".into());
+    }
+    Ok(Some((
+        format!("{} {}", manifest.reader, manifest.reader_version),
+        pages,
+    )))
+}
+
+fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Result<Value> {
     valid_sha(sha)?;
     let (aliases, metadata): (String, String) = connection.query_row(
         "SELECT aliases,metadata FROM documents WHERE sha256=?1",
@@ -513,6 +561,12 @@ fn paragraph(connection: &Connection, sha: &str, label: &str) -> Result<Value> {
         })?
         .collect::<std::result::Result<_, _>>()?;
     let mut result = paragraphs::lookup(&pages, label)?;
+    let reading = if result["status"] == "found" {
+        second_reading(root, sha, pages.len())?
+    } else {
+        None
+    };
+    paragraphs::confirm(&mut result, reading.as_ref());
     result["document_sha256"] = json!(sha);
     result["sources"] = serde_json::from_str(&aliases)?;
     result["version_metadata"] = serde_json::from_str(&metadata)?;
@@ -682,7 +736,9 @@ fn run() -> Result<Value> {
             &arguments[2],
             &QueryOptions::parse(&arguments[3..])?,
         ),
-        "paragraph" if arguments.len() == 4 => paragraph(&connection, &arguments[2], &arguments[3]),
+        "paragraph" if arguments.len() == 4 => {
+            paragraph(root, &connection, &arguments[2], &arguments[3])
+        }
         "page" if arguments.len() == 4 => page(&connection, &arguments[2], arguments[3].parse()?),
         "verify" if arguments.len() == 2 => verify(root, &connection),
         "verify-quote" if arguments.len() == 4 => {
@@ -914,6 +970,40 @@ mod tests {
         assert!(search(&connection, "\"", &QueryOptions::default()).is_err());
     }
     #[test]
+    fn paragraph_lookup_requires_an_unchanged_second_reading() {
+        let root = fixture();
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection).unwrap();
+        let sha = "f".repeat(64);
+        let text = "35 A fabricated requirement.\n36 Next requirement.";
+        connection
+            .execute("INSERT INTO documents VALUES(?1,1,'[]','[]',?1)", [&sha])
+            .unwrap();
+        connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,1,?2,?3,'native',0)",
+            params![sha, text, hash(text.as_bytes())]).unwrap();
+        let status = || paragraph(&root, &connection, &sha, "35").map(|r| r["status"].clone());
+        assert_eq!(status().unwrap(), "found_unconfirmed");
+        let folder = root.join("second-reader");
+        fs::create_dir_all(folder.join(&sha)).unwrap();
+        let write = |pages: &str, digest: &str| {
+            fs::write(folder.join(&sha).join("pages.jsonl"), pages).unwrap();
+            let manifest = json!({"reader":"fabricated","reader_version":"1",
+                "documents":[{"sha256":sha,"page_count":1,"pages_sha256":digest}]});
+            fs::write(folder.join("manifest.json"), manifest.to_string()).unwrap();
+        };
+        let reading = "{\"page\":1,\"text\":\"35 A fabri cated requirement. 36 Next\"}\n";
+        write(reading, &hash(reading.as_bytes()));
+        assert_eq!(status().unwrap(), "found");
+        let other = "{\"page\":1,\"text\":\"35 Another requirement. 36 Next\"}\n";
+        write(other, &hash(other.as_bytes()));
+        assert_eq!(status().unwrap(), "needs_review");
+        write(other, &hash(reading.as_bytes()));
+        assert!(status().is_err());
+        let two = format!("{reading}{{\"page\":2,\"text\":\"\"}}\n");
+        write(&two, &hash(two.as_bytes()));
+        assert!(status().is_err());
+    }
+    #[test]
     fn whitespace_pages_are_counted_for_review() {
         let connection = Connection::open_in_memory().unwrap();
         schema(&connection).unwrap();
@@ -1023,7 +1113,7 @@ mod tests {
         };
         assert_eq!(catalogue(&connection, &options).unwrap()["next_offset"], 2);
         assert_eq!(
-            paragraph(&connection, &"b".repeat(64), "35").unwrap()["status"],
+            paragraph(Path::new("absent"), &connection, &"b".repeat(64), "35").unwrap()["status"],
             "ambiguous"
         );
     }
