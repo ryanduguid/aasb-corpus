@@ -118,6 +118,13 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
                             .collect::<Vec<_>>()
                             .join("\n")
                     );
+                    if found["status"] == "found" {
+                        let line = fragment["text"].as_str().unwrap().lines().next().unwrap();
+                        let pdf_page = fragment["pdf_page"].to_string();
+                        let checked = call(&root, "verify-quote", &[sha, &pdf_page, line]);
+                        assert_eq!(checked["verified"], true);
+                        assert_eq!(checked["page_text_sha256"], fragment["page_text_sha256"]);
+                    }
                     spans += 1;
                 }
             }

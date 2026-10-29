@@ -84,11 +84,67 @@ fn valid_sha(value: &str) -> Result<()> {
 fn literal(text: &str) -> String {
     text.nfkc().collect::<String>().replace('\u{2010}', "-")
 }
-fn quote_in_text(quote: &str, text: &str) -> Result<bool> {
-    if quote.trim().is_empty() {
+fn words(text: &str) -> Vec<String> {
+    literal(text)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+// Fewer consecutive words than this are too common to locate a quotation.
+const PARTIAL_MIN_WORDS: usize = 4;
+
+/// Grades a quotation against one page, strongest first: `exact` bytes; `normalised` under
+/// the compatibility rules or after collapsing whitespace; `partial` for the longest run of
+/// consecutive quotation words; otherwise `none`. Comparison stays case-sensitive.
+fn grade_quote(quote: &str, text: &str) -> Result<Value> {
+    let quote_words = words(quote);
+    if quote_words.is_empty() {
         return Err("a blank quotation is not valid".into());
     }
-    Ok(literal(text).contains(&literal(quote)))
+    if text.contains(quote) {
+        return Ok(json!({"grade":"exact"}));
+    }
+    let page_words = words(text);
+    if literal(text).contains(&literal(quote))
+        || page_words
+            .windows(quote_words.len())
+            .any(|window| window == quote_words)
+    {
+        return Ok(json!({"grade":"normalised"}));
+    }
+    // Longest common run of words: run[j] is the run ending at quotation word j.
+    let (mut length, mut end) = (0, 0);
+    let mut run = vec![0; quote_words.len() + 1];
+    for word in &page_words {
+        for j in (1..=quote_words.len()).rev() {
+            run[j] = if &quote_words[j - 1] == word {
+                run[j - 1] + 1
+            } else {
+                0
+            };
+            if run[j] > length {
+                (length, end) = (run[j], j);
+            }
+        }
+    }
+    if length < PARTIAL_MIN_WORDS {
+        return Ok(json!({"grade":"none"}));
+    }
+    Ok(
+        json!({"grade":"partial","matched_words":length,"quote_words":quote_words.len(),
+        "first_matched_word":end - length + 1}),
+    )
+}
+
+fn grade_rank(grade: &Value) -> (usize, u64) {
+    let rank = match grade["grade"].as_str() {
+        Some("exact") => 3,
+        Some("normalised") => 2,
+        Some("partial") => 1,
+        _ => 0,
+    };
+    (rank, grade["matched_words"].as_u64().unwrap_or(0))
 }
 
 fn schema(connection: &Connection) -> Result<()> {
@@ -486,6 +542,76 @@ fn page(connection: &Connection, sha: &str, number: u32) -> Result<Value> {
     )
 }
 
+/// Only an exact match on a named native page is verified; a search without a page,
+/// normalised or partial grades and OCR or review pages only locate candidates.
+fn verify_quote(
+    connection: &Connection,
+    sha: &str,
+    number: Option<u32>,
+    quote: &str,
+) -> Result<Value> {
+    valid_sha(sha)?;
+    let (aliases, metadata): (String, String) = connection.query_row(
+        "SELECT aliases,metadata FROM documents WHERE sha256=?1",
+        [sha],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT page,text,text_sha256,provenance,needs_review FROM pages
+        WHERE document_sha256=?1 AND (?2 IS NULL OR page=?2) ORDER BY page",
+    )?;
+    let mut pages = Vec::new();
+    for row in statement.query_map(params![sha, number], |r| {
+        Ok((
+            r.get::<_, u32>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, bool>(4)?,
+        ))
+    })? {
+        let (page, text, digest, provenance, needs_review) = row?;
+        if hash(text.as_bytes()) != digest {
+            return Err("indexed text digest differs".into());
+        }
+        let mut result = grade_quote(quote, &text)?;
+        result["pdf_page"] = json!(page);
+        result["page_text_sha256"] = json!(digest);
+        result["provenance"] = json!(provenance);
+        result["needs_review"] = json!(needs_review);
+        pages.push(result);
+    }
+    if pages.is_empty() {
+        return Err("page is not present in this document".into());
+    }
+    let best = pages.iter().map(grade_rank).max().unwrap_or_default();
+    let mut result = if number.is_some() {
+        pages.swap_remove(0)
+    } else {
+        let located: Vec<_> = pages
+            .into_iter()
+            .filter(|page| best.0 > 0 && grade_rank(page) == best)
+            .collect();
+        json!({"pdf_page":null,"grade":(["none","partial","normalised","exact"][best.0]),
+            "located_page_count":located.len(),"pages_truncated":located.len() > 20,
+            "pages":located.into_iter().take(20).collect::<Vec<_>>()})
+    };
+    let verified = number.is_some()
+        && result["grade"] == "exact"
+        && result["provenance"] == "native"
+        && result["needs_review"] == false;
+    result["verified"] = json!(verified);
+    // Retained for existing callers, with the stricter meaning.
+    result["matches"] = json!(verified);
+    result["document_sha256"] = json!(sha);
+    result["sources"] = serde_json::from_str(&aliases)?;
+    result["version_metadata"] = serde_json::from_str(&metadata)?;
+    result["boundary"] = json!(
+        "Only an exact match on a named native page of the selected PDF is verified. Normalised and partial grades, OCR or review pages and searches without a page locate candidates for review. A text match does not establish accounting applicability."
+    );
+    Ok(result)
+}
+
 fn verify(root: &Path, connection: &Connection) -> Result<Value> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -559,13 +685,15 @@ fn run() -> Result<Value> {
         "paragraph" if arguments.len() == 4 => paragraph(&connection, &arguments[2], &arguments[3]),
         "page" if arguments.len() == 4 => page(&connection, &arguments[2], arguments[3].parse()?),
         "verify" if arguments.len() == 2 => verify(root, &connection),
-        "verify-quote" if arguments.len() == 5 => {
-            let result = page(&connection, &arguments[2], arguments[3].parse()?)?;
-            Ok(
-                json!({"matches":quote_in_text(&arguments[4],result["text"].as_str().ok_or("missing text")?)?,
-                "boundary":"A text match does not establish accounting applicability."}),
-            )
+        "verify-quote" if arguments.len() == 4 => {
+            verify_quote(&connection, &arguments[2], None, &arguments[3])
         }
+        "verify-quote" if arguments.len() == 5 => verify_quote(
+            &connection,
+            &arguments[2],
+            Some(arguments[3].parse()?),
+            &arguments[4],
+        ),
         _ => Err("invalid command or arguments".into()),
     }
 }
@@ -667,16 +795,89 @@ mod tests {
         // A failed build must not leave a staging file that blocks a corrected rebuild.
         assert!(!root.join("index.sqlite3.partial").exists());
     }
+    fn grade(quote: &str, text: &str) -> Value {
+        grade_quote(quote, text).unwrap()["grade"].clone()
+    }
     #[test]
     fn quotation_is_case_sensitive_and_rejects_blank() {
-        assert!(quote_in_text("deduct from", "You can deduct from income").unwrap());
-        assert!(!quote_in_text("Deduct from", "You can deduct from income").unwrap());
-        assert!(quote_in_text("  ", "text").is_err());
+        assert_eq!(grade("deduct from", "You can deduct from income"), "exact");
+        assert_eq!(grade("Deduct from", "You can deduct from income"), "none");
+        assert!(grade_quote("  ", "text").is_err());
     }
     #[test]
     fn compatibility_matching_preserves_the_tax_corpus_contract() {
-        assert!(quote_in_text("40-1", "40\u{2011}1").unwrap());
-        assert!(quote_in_text("office", "of\u{fb01}ce").unwrap());
+        assert_eq!(grade("40-1", "40\u{2011}1"), "normalised");
+        assert_eq!(grade("office", "of\u{fb01}ce"), "normalised");
+        assert_eq!(
+            grade("can deduct from", "You can\n deduct  from"),
+            "normalised"
+        );
+    }
+    #[test]
+    fn partial_grades_report_the_longest_run_of_quotation_words() {
+        let text = "A fabricated lessee measures the lease liability at cost.";
+        let partial = grade_quote(
+            "Always: a lessee measures the lease liability at fair value.",
+            text,
+        )
+        .unwrap();
+        assert_eq!(partial["grade"], "partial");
+        assert_eq!(partial["matched_words"], 6);
+        assert_eq!(partial["quote_words"], 10);
+        assert_eq!(partial["first_matched_word"], 3);
+        assert_eq!(grade("the lease liability differs", text), "none");
+    }
+
+    fn quote_fixture() -> (Connection, String) {
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection).unwrap();
+        let sha = "e".repeat(64);
+        connection
+            .execute("INSERT INTO documents VALUES(?1,3,'[]','[]',?1)", [&sha])
+            .unwrap();
+        for (number, text, provenance) in [
+            (1, "A fabricated lease\nliability is measured.", "native"),
+            (2, "A fabricated lease liability is measured.", "native"),
+            (3, "A fabricated lease liability is measured.", "ocr"),
+        ] {
+            connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![sha,number,text,hash(text.as_bytes()),provenance,provenance == "ocr"]).unwrap();
+        }
+        (connection, sha)
+    }
+    #[test]
+    fn only_exact_matches_on_a_named_native_page_are_verified() {
+        let (connection, sha) = quote_fixture();
+        let quote = "fabricated lease liability";
+        let exact = verify_quote(&connection, &sha, Some(2), quote).unwrap();
+        assert_eq!(exact["grade"], "exact");
+        assert_eq!(exact["verified"], true);
+        assert_eq!(exact["matches"], true);
+        assert_eq!(exact["pdf_page"], 2);
+        assert_eq!(
+            exact["page_text_sha256"],
+            hash(b"A fabricated lease liability is measured.")
+        );
+        assert_eq!(exact["document_sha256"], sha);
+        for (page, grade) in [(1, "normalised"), (3, "exact")] {
+            let found = verify_quote(&connection, &sha, Some(page), quote).unwrap();
+            assert_eq!(found["grade"], grade);
+            assert_eq!(found["verified"], false);
+            assert_eq!(found["matches"], false);
+        }
+        let searched = verify_quote(&connection, &sha, None, quote).unwrap();
+        assert_eq!(searched["grade"], "exact");
+        assert_eq!(searched["verified"], false);
+        assert_eq!(searched["located_page_count"], 2);
+        assert_eq!(searched["pages"][0]["pdf_page"], 2);
+        let missing = verify_quote(&connection, &sha, None, "an unrelated quotation").unwrap();
+        assert_eq!(missing["grade"], "none");
+        assert_eq!(missing["pages"], json!([]));
+        assert!(verify_quote(&connection, &sha, Some(4), quote).is_err());
+        connection
+            .execute("UPDATE pages SET text='changed' WHERE page=2", [])
+            .unwrap();
+        assert!(verify_quote(&connection, &sha, Some(2), quote).is_err());
     }
     #[test]
     fn source_names_cannot_escape_the_snapshot() {

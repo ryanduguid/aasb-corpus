@@ -69,7 +69,25 @@ The result retains document metadata and candidate fragments with physical PDF p
 
 Only treat `found` as a located source span; the accounting conclusion remains separate. Lookup excludes recognised contents pages, bounds output to 20 candidates and withholds candidate text above 64 KiB while preserving page references. Unsupported layouts require reading the cited PDF pages. No general PDF-layout accuracy is claimed.
 
-`page SNAPSHOT SHA256 PAGE` returns a full extracted page. `verify-quote SNAPSHOT SHA256 PAGE QUOTE` checks a case-sensitive quotation under the tax corpus's Unicode compatibility rules. A match establishes textual fidelity under those rules, not accounting applicability.
+`page SNAPSHOT SHA256 PAGE` returns a full extracted page.
+
+### Check a quotation
+
+```powershell
+& .\target\release\aasb-corpus.exe verify-quote $snapshot $version 12 'quoted words'
+& .\target\release\aasb-corpus.exe verify-quote $snapshot $version 'quoted words'
+```
+
+`verify-quote SNAPSHOT SHA256 [PAGE] QUOTE` grades a case-sensitive quotation against the indexed page text:
+
+- `exact`: the quotation's bytes appear unchanged in the page text.
+- `normalised`: it matches only under the tax corpus's Unicode compatibility rules or after collapsing whitespace.
+- `partial`: at least 4 consecutive quotation words match. `matched_words`, `quote_words` and the one-based `first_matched_word` describe the longest run.
+- `none`: no grade above applies.
+
+`verified` is true only for an `exact` grade on the named physical page of the selected PDF, where that page is native text without review flags. The result binds it to `document_sha256`, `pdf_page`, `page_text_sha256` and `version_metadata`; the page text is rehashed against the index first. `matches` repeats `verified` for existing callers; before graded checking it also accepted normalised matches.
+
+Without PAGE the command searches every page of the selected PDF and lists up to 20 pages with the strongest grade under `pages`, but `verified` stays false: run it again with a listed page to verify. Normalised and partial grades, OCR or review pages and searches without a page locate candidates for review. A verified match establishes textual fidelity, not accounting applicability.
 
 Other repositories can invoke this executable or read the SQLite database directly. Search connections are read-only. No consumer repository changes are needed to use the shared snapshot.
 
