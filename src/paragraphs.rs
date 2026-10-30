@@ -257,6 +257,106 @@ pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
     )
 }
 
+fn tokens(text: &str) -> Vec<String> {
+    crate::literal(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// True when the fragment's words appear contiguously in `reading`, starting and ending on
+/// reading word boundaries. Case is kept and markup and punctuation are ignored. The reader
+/// may split one fragment word into adjacent pieces (for example at a kerning gap), but no
+/// reading word may be skipped, joined across fragment words or matched in part.
+fn contiguous(fragment: &str, reading: &str) -> bool {
+    let (fragment, reading) = (tokens(fragment), tokens(reading));
+    let matches_at = |mut next: usize| {
+        fragment.iter().all(|word| {
+            let mut rest = word.as_str();
+            while !rest.is_empty() {
+                match reading
+                    .get(next)
+                    .and_then(|piece| rest.strip_prefix(piece.as_str()))
+                {
+                    Some(remaining) => (rest, next) = (remaining, next + 1),
+                    None => return false,
+                }
+            }
+            true
+        })
+    };
+    !fragment.is_empty() && (0..reading.len()).any(matches_at)
+}
+
+/// Confirms a `found` paragraph against an independent reading of the same PDF pages.
+/// Without that reading the status becomes `found_unconfirmed`; a mismatch or a fragment
+/// without words needs review.
+/// A found result without fragments, fragment text or physical pages is an error.
+pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)>) -> Result<()> {
+    if result["status"] != "found" {
+        result["second_reader"] = json!({"status":"not_checked"});
+        return Ok(());
+    }
+    let mut fragments = Vec::new();
+    for fragment in result["candidates"][0]["fragments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        match (fragment["text"].as_str(), fragment["pdf_page"].as_u64()) {
+            (Some(text), Some(page)) if page > 0 => fragments.push((text.to_owned(), page)),
+            _ => return Err("found paragraph has a fragment without text or a page".into()),
+        }
+    }
+    if fragments.is_empty() {
+        return Err("found paragraph has no fragments".into());
+    }
+    if fragments.iter().any(|(text, _)| tokens(text).is_empty()) {
+        let candidate = &mut result["candidates"][0];
+        candidate["needs_review"] = json!(true);
+        if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
+            reasons.push(json!(
+                "A fragment has no words for a second reader to confirm."
+            ));
+        }
+        result["status"] = json!("needs_review");
+        result["second_reader"] = json!({"status":"not_checked"});
+        return Ok(());
+    }
+    let Some((reader, pages)) = reading else {
+        result["status"] = json!("found_unconfirmed");
+        result["second_reader"] = json!({"status":"unavailable"});
+        return Ok(());
+    };
+    let mut unconfirmed: Vec<u64> = fragments
+        .iter()
+        .filter(|(text, page)| {
+            !usize::try_from(*page - 1)
+                .ok()
+                .and_then(|index| pages.get(index))
+                .is_some_and(|reading| contiguous(text, reading))
+        })
+        .map(|(_, page)| *page)
+        .collect();
+    unconfirmed.dedup();
+    if unconfirmed.is_empty() {
+        result["second_reader"] = json!({"status":"confirmed","reader":reader});
+        return Ok(());
+    }
+    let candidate = &mut result["candidates"][0];
+    candidate["needs_review"] = json!(true);
+    if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
+        reasons.push(json!(
+            "A second reader did not confirm the fragment's words in order on its page."
+        ));
+    }
+    result["status"] = json!("needs_review");
+    result["second_reader"] =
+        json!({"status":"mismatch","reader":reader,"unconfirmed_pages":unconfirmed});
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +367,108 @@ mod tests {
             provenance: "native".into(),
             needs_review: false,
         }
+    }
+
+    #[test]
+    fn second_reader_words_must_appear_contiguously_on_the_page() {
+        let fragment = "**35** A fabricated requirement applies.";
+        assert!(contiguous(
+            fragment,
+            "Header\n35 A fabri cated require-\nment\napplies. 36"
+        ));
+        assert!(!contiguous(fragment, "35 A fabricated requirement."));
+        assert!(!contiguous(
+            fragment,
+            "35 A requirement applies fabricated."
+        ));
+        assert!(!contiguous(
+            fragment,
+            "35 a fabricated requirement applies."
+        ));
+        // No match inside longer words, across skipped words or across joined words.
+        assert!(!contiguous("one cat", "stone category"));
+        assert!(!contiguous("alpha beta", "alpha unrelated beta"));
+        assert!(!contiguous(
+            "fabricated re-\nquirement",
+            "fabricated requirement"
+        ));
+        assert!(!contiguous("--", "-- text"));
+    }
+
+    #[test]
+    fn found_paragraphs_need_an_independent_reading_of_their_pages() {
+        let pages = [page(
+            1,
+            "35 A fabricated requirement.\n36 Next requirement.",
+        )];
+        let checked = |reading: Option<&(String, Vec<String>)>| {
+            let mut result = lookup(&pages, "35").unwrap();
+            assert_eq!(result["status"], "found");
+            confirm(&mut result, reading).unwrap();
+            result
+        };
+        let reader = |text: &str| ("fabricated 1".to_owned(), vec![text.to_owned()]);
+        let confirmed = checked(Some(&reader("35 A fabricated requirement. 36 Next")));
+        assert_eq!(confirmed["status"], "found");
+        assert_eq!(confirmed["second_reader"]["status"], "confirmed");
+        assert_eq!(confirmed["second_reader"]["reader"], "fabricated 1");
+        let mismatch = checked(Some(&reader("35 A requirement. 36 Next")));
+        assert_eq!(mismatch["status"], "needs_review");
+        assert_eq!(mismatch["second_reader"]["status"], "mismatch");
+        assert_eq!(mismatch["second_reader"]["unconfirmed_pages"], json!([1]));
+        assert_eq!(mismatch["candidates"][0]["needs_review"], true);
+        let missing_page = checked(Some(&("fabricated 1".to_owned(), vec![])));
+        assert_eq!(missing_page["status"], "needs_review");
+        let unavailable = checked(None);
+        assert_eq!(unavailable["status"], "found_unconfirmed");
+        assert_eq!(unavailable["second_reader"]["status"], "unavailable");
+        let repeated = [pages[0].text.as_str(), "35 Again.\n36 Next."];
+        let repeated: Vec<_> = (1..).zip(repeated).map(|(n, t)| page(n, t)).collect();
+        let mut ambiguous = lookup(&repeated, "35").unwrap();
+        confirm(&mut ambiguous, None).unwrap();
+        assert_eq!(ambiguous["status"], "ambiguous");
+        assert_eq!(ambiguous["second_reader"]["status"], "not_checked");
+    }
+
+    #[test]
+    fn malformed_found_results_cannot_be_confirmed() {
+        let mut found = lookup(&[page(1, "35 A fabricated requirement.\n36 Next.")], "35").unwrap();
+        // A second valid fragment ensures a malformed one cannot simply be skipped.
+        let valid = found["candidates"][0]["fragments"][0].clone();
+        found["candidates"][0]["fragments"]
+            .as_array_mut()
+            .unwrap()
+            .push(valid);
+        let reading = (
+            "fabricated 1".to_owned(),
+            vec!["35 A fabricated requirement.".to_owned()],
+        );
+        let fragment = "/candidates/0/fragments/0";
+        let mutations: [(&str, Value); 4] = [
+            ("/candidates/0/fragments", json!([])),
+            ("/candidates/0/fragments", Value::Null),
+            (&format!("{fragment}/text"), Value::Null),
+            (&format!("{fragment}/pdf_page"), Value::Null),
+        ];
+        for (pointer, value) in mutations {
+            let mut result = found.clone();
+            *result.pointer_mut(pointer).unwrap() = value;
+            assert!(confirm(&mut result, Some(&reading)).is_err(), "{pointer}");
+            assert!(confirm(&mut result, None).is_err(), "{pointer}");
+        }
+        let mut blank = found.clone();
+        blank["candidates"][0]["fragments"][0]["text"] = json!("--");
+        confirm(&mut blank, Some(&reading)).unwrap();
+        assert_eq!(blank["status"], "needs_review");
+    }
+
+    #[test]
+    fn wordless_fragments_need_review_without_a_reading() {
+        let mut blank = lookup(&[page(1, "35 A fabricated requirement.\n36 Next.")], "35").unwrap();
+        blank["candidates"][0]["fragments"][0]["text"] = json!("--");
+        confirm(&mut blank, None).unwrap();
+        assert_eq!(blank["status"], "needs_review");
+        assert_eq!(blank["candidates"][0]["needs_review"], true);
     }
 
     #[test]

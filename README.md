@@ -2,7 +2,7 @@
 
 Extract local AASB PDFs into page records and search them through a Rust CLI and SQLite FTS5 index. Results retain the source PDF hash, physical PDF page number, original URL and catalogue version metadata. The corpus is a finding aid; selecting an applicable reporting framework or version remains a separate review.
 
-The installed pdf-inspector exposes its extraction and offline OCR through Python, so `tools/extract.py` is the native extraction bridge. Indexing, search, page lookup, quotation checks and verification are Rust. No command uploads documents, calls a model provider or downloads content.
+The installed pdf-inspector exposes its extraction and offline OCR through Python, so `tools/extract.py` is the native extraction bridge. `tools/second_reader.py` reads the same PDFs with pypdf, already installed in that environment, to confirm paragraph lookups without a new dependency. Indexing, search, page lookup, quotation checks and verification are Rust. No command uploads documents, calls a model provider or downloads content.
 
 ## Current local snapshot
 
@@ -62,14 +62,37 @@ Supply an exact PDF hash and a label such as `35`, `B19`, `Aus25.1` or `BC1`. Re
 
 The result retains document metadata and candidate fragments with physical PDF pages, one-based inclusive line spans, page-text hashes, native/OCR provenance and review flags. Each fragment is an unchanged slice of the indexed page. Continuations can span multiple pages; recognised page footers are excluded. Recognised `Corresponding AASB Standard` footnotes are returned separately from the paragraph text.
 
-- `found` means one candidate has native text and an ending confirmed by an adjacent paragraph label.
+- `found` means one candidate has native text and an ending confirmed by an adjacent paragraph label, and a second reader confirms it (below).
+- `found_unconfirmed` meets the other `found` conditions, but the snapshot has no `second-reader/` folder, pypdf's failure on the selected PDF is recorded, or a source file recorded for the PDF is missing, unreadable or replaced.
 - `ambiguous` preserves repeated occurrences for review, including possible examples or amendments.
 - `needs_review` identifies uncertain endings, headings that interrupt unanchored content, page gaps, tables or OCR/review flags.
 - `not_found` means no supported extracted line anchor was found. It does not establish that the PDF lacks the paragraph.
 
+The second reader is pypdf, a PDF parser independent of pdf-inspector that is installed in the same environment. `tools/second_reader.py` stores its text for every page in `second-reader/`, with per-document digests. Before reporting `found`, lookup checks that each fragment's words appear contiguously in pypdf's text of the same physical page, starting and ending on pypdf word boundaries. Punctuation, markup and spacing are ignored and case is kept. pypdf may split one word into adjacent pieces, as it does at some kerning gaps, but no pypdf word may be skipped, matched in part or joined across fragment words. A mismatch, or a fragment without words, reports `needs_review` with a review reason. Lookup first rehashes every source file recorded for the PDF and confirms nothing if any is missing or changed. `second_reader` records `confirmed`, `mismatch` (with `unconfirmed_pages`), `unavailable`, `source_changed` (with one entry in `reasons` per missing, unreadable or replaced file) or `not_checked`, plus the reader and its version.
+
+Once `second-reader/` exists, its manifest must have the supported schema and reader, the digest of the current source manifest, and exactly one document or recorded failure for each source PDF; each reading must match its digest and cover every page. Anything else, including a missing manifest, is an error rather than `found_unconfirmed`. So is a found result without fragment text or physical pages.
+
 Only treat `found` as a located source span; the accounting conclusion remains separate. Lookup excludes recognised contents pages, bounds output to 20 candidates and withholds candidate text above 64 KiB while preserving page references. Unsupported layouts require reading the cited PDF pages. No general PDF-layout accuracy is claimed.
 
-`page SNAPSHOT SHA256 PAGE` returns a full extracted page. `verify-quote SNAPSHOT SHA256 PAGE QUOTE` checks a case-sensitive quotation under the tax corpus's Unicode compatibility rules. A match establishes textual fidelity under those rules, not accounting applicability.
+`page SNAPSHOT SHA256 PAGE` returns a full extracted page.
+
+### Check a quotation
+
+```powershell
+& .\target\release\aasb-corpus.exe verify-quote $snapshot $version 12 'quoted words'
+& .\target\release\aasb-corpus.exe verify-quote $snapshot $version 'quoted words'
+```
+
+`verify-quote SNAPSHOT SHA256 [PAGE] QUOTE` grades a case-sensitive quotation against the indexed page text:
+
+- `exact`: the quotation's bytes appear unchanged in the page text.
+- `normalised`: it matches only under the tax corpus's Unicode compatibility rules or after collapsing whitespace.
+- `partial`: at least 4 consecutive quotation words match. `matched_words`, `quote_words` and the one-based `first_matched_word` describe the longest run.
+- `none`: no grade above applies.
+
+`verified` is true only for an `exact` grade on the named physical page of the selected PDF, where that page is native text without review flags and every source file recorded for the PDF still has its hash. The result binds it to `document_sha256`, `pdf_page`, `page_text_sha256` and `version_metadata`; the page text is rehashed against the index first. `unverified_reasons` lists each unmet condition, including each missing or replaced source PDF file by name. `matches` repeats `verified` for existing callers; before graded checking it also accepted normalised matches.
+
+Without PAGE the command searches every page of the selected PDF and lists up to 20 pages with the strongest grade under `pages`, but `verified` stays false: run it again with a listed page to verify. Normalised and partial grades, OCR or review pages and searches without a page locate candidates for review. A verified match establishes textual fidelity, not accounting applicability.
 
 Other repositories can invoke this executable or read the SQLite database directly. Search connections are read-only. No consumer repository changes are needed to use the shared snapshot.
 
@@ -79,10 +102,13 @@ Copy the authorised PDFs, download manifest and catalogue into a new snapshot wi
 
 ```powershell
 & 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 tools/extract.py 'C:\path\to\new-snapshot'
+& 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 tools/second_reader.py 'C:\path\to\new-snapshot'
 & .\target\release\aasb-corpus.exe build 'C:\path\to\new-snapshot'
 ```
 
 On the Linux sandbox, use `agent-run pdf-inspector-python tools/extract.py SNAPSHOT`. The extractor verifies source hashes, checks every page index, uses offline OCR only where pdf-inspector requests it and retains review flags. It stages extraction before renaming the completed folder. Indexing checks input hashes and complete document/page coverage, builds and checks FTS5 in one transaction, then promotes a new index. Failed stages are retained for inspection and never replace a completed snapshot.
+
+`tools/second_reader.py` stages its output and adds `second-reader/` to an existing snapshot without changing the index; it refuses an existing output folder. A missing, unreadable or changed source file, a `page_count` in the source manifest that is not a positive integer or differs between entries with one SHA-256, or a source manifest that changes during the run, stops it with nothing promoted. Only a PDF whose verified bytes pypdf cannot read, or reads with a different page count, is listed under `failures` with its hash; its paragraphs report `found_unconfirmed`.
 
 ## Checks
 
