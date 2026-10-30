@@ -108,7 +108,7 @@ Copy the authorised PDFs, download manifest and catalogue into a new snapshot wi
 
 On the Linux sandbox, use `agent-run pdf-inspector-python tools/extract.py SNAPSHOT`. The extractor verifies source hashes, checks every page index, uses offline OCR only where pdf-inspector requests it and retains review flags. It stages extraction before renaming the completed folder. Indexing checks input hashes and complete document/page coverage, builds and checks FTS5 in one transaction, then promotes a new index. Failed stages are retained for inspection and never replace a completed snapshot.
 
-`tools/second_reader.py` stages its output and adds `second-reader/` to an existing snapshot without changing the index; it refuses an existing output folder. A missing, unreadable or changed source file, a `page_count` in the source manifest that is not a positive integer, or a source manifest that changes during the run, stops it with nothing promoted. Only a PDF whose verified bytes pypdf cannot read, or reads with a different page count, is listed under `failures` with its hash; its paragraphs report `found_unconfirmed`.
+`tools/second_reader.py` stages its output and adds `second-reader/` to an existing snapshot without changing the index; it refuses an existing output folder. A missing, unreadable or changed source file, a `page_count` in the source manifest that is not a positive integer or differs between entries with one SHA-256, or a source manifest that changes during the run, stops it with nothing promoted. Only a PDF whose verified bytes pypdf cannot read, or reads with a different page count, is listed under `failures` with its hash; its paragraphs report `found_unconfirmed`.
 
 ## Checks
 

@@ -21,11 +21,14 @@ def read(root):
     stage = root / "second-reader.partial"
     if final.exists() or stage.exists():
         raise ValueError("Second-reader destination already exists; remove it deliberately to rerun")
+    counts = {}
     for entry in manifest["files"]:
         # Manifest metadata errors are fatal, not per-document pypdf failures.
         count = entry.get("page_count")
         if type(count) is not int or count < 1:
             raise ValueError(f"Download manifest page_count is not a positive integer: {entry.get('filename')}")
+        if counts.setdefault(entry["sha256"], count) != count:
+            raise ValueError(f"Download manifest page_count conflicts for one SHA-256: {entry.get('filename')}")
     stage.mkdir()
     documents = {}
     failures = {}

@@ -606,7 +606,7 @@ fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Re
         None
     };
     paragraphs::confirm(&mut result, reading.as_ref())?;
-    if !problems.is_empty() && result["status"] == "found_unconfirmed" {
+    if !problems.is_empty() {
         result["second_reader"] = json!({"status":"source_changed","reasons":problems});
     }
     result["document_sha256"] = json!(sha);
@@ -1172,6 +1172,29 @@ mod tests {
         assert_eq!(status().unwrap(), "found");
         fs::remove_file(folder.join("manifest.json")).unwrap();
         assert!(status().is_err());
+    }
+    #[test]
+    fn source_problems_are_reported_when_a_wordless_fragment_needs_review() {
+        let (root, connection, sha) = paragraph_fixture();
+        let first = "35 A fabricated requirement.";
+        connection
+            .execute(
+                "UPDATE pages SET text=?1,text_sha256=?2",
+                params![first, hash(first.as_bytes())],
+            )
+            .unwrap();
+        let second = "--\n36 Next requirement.";
+        connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,2,?2,?3,'native',0)",
+            params![sha, second, hash(second.as_bytes())]).unwrap();
+        fs::write(root.join("source/sample.pdf"), b"Replaced fabricated bytes").unwrap();
+        let result = paragraph(&root, &connection, &sha, "35").unwrap();
+        assert_eq!(result["candidates"][0]["fragments"][1]["text"], "--");
+        assert_eq!(result["status"], "needs_review");
+        assert_eq!(result["second_reader"]["status"], "source_changed");
+        assert_eq!(
+            result["second_reader"]["reasons"],
+            json!(["Source PDF file sample.pdf no longer matches the document hash."])
+        );
     }
     #[test]
     fn a_replaced_or_removed_source_pdf_is_never_confirmed() {

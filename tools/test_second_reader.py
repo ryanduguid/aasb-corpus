@@ -78,6 +78,15 @@ class SecondReaderTests(unittest.TestCase):
                     second_reader.read(root)
                 self.assertFalse((root / "second-reader").exists())
 
+    def test_conflicting_page_counts_for_one_hash_are_fatal_and_stage_nothing(self):
+        content = fabricated_pdf(1)
+        with tempfile.TemporaryDirectory() as folder:
+            root = snapshot(folder, [("sample.pdf", content, 1, None), ("copy.pdf", content, 2, None)])
+            with self.assertRaises(ValueError):
+                second_reader.read(root)
+            self.assertFalse((root / "second-reader").exists())
+            self.assertFalse((root / "second-reader.partial").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
