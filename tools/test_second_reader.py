@@ -64,6 +64,20 @@ class SecondReaderTests(unittest.TestCase):
                     second_reader.read(root)
                 self.assertFalse((root / "second-reader").exists())
 
+    def test_invalid_page_counts_are_fatal_and_publish_nothing(self):
+        content = fabricated_pdf(1)
+        for pages in (None, 0, -1, "1", True, 1.0, "missing"):
+            with self.subTest(pages=pages), tempfile.TemporaryDirectory() as folder:
+                root = snapshot(folder, [("sample.pdf", content, pages, None)])
+                if pages == "missing":
+                    manifest = root / "source" / "manifest.json"
+                    entries = json.loads(manifest.read_text(encoding="utf-8"))
+                    del entries["files"][0]["page_count"]
+                    manifest.write_text(json.dumps(entries), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    second_reader.read(root)
+                self.assertFalse((root / "second-reader").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

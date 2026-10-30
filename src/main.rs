@@ -593,14 +593,24 @@ fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Re
         })?
         .collect::<std::result::Result<_, _>>()?;
     let mut result = paragraphs::lookup(&pages, label)?;
-    let reading = if result["status"] == "found" {
+    let sources: Value = serde_json::from_str(&aliases)?;
+    // A reading of replaced or removed source bytes cannot confirm the indexed text.
+    let problems = if result["status"] == "found" {
+        source_problems(root, sha, &sources)?
+    } else {
+        Vec::new()
+    };
+    let reading = if result["status"] == "found" && problems.is_empty() {
         second_reading(root, sha, pages.len())?
     } else {
         None
     };
     paragraphs::confirm(&mut result, reading.as_ref())?;
+    if !problems.is_empty() && result["status"] == "found_unconfirmed" {
+        result["second_reader"] = json!({"status":"source_changed","reasons":problems});
+    }
     result["document_sha256"] = json!(sha);
-    result["sources"] = serde_json::from_str(&aliases)?;
+    result["sources"] = sources;
     result["version_metadata"] = serde_json::from_str(&metadata)?;
     Ok(result)
 }
@@ -628,25 +638,27 @@ fn page(connection: &Connection, sha: &str, number: u32) -> Result<Value> {
     )
 }
 
-/// Rehashes each source file recorded for a PDF; `None` when every file is unchanged.
-fn source_problem(root: &Path, sha: &str, aliases: &Value) -> Result<Option<&'static str>> {
+/// Rehashes each source file recorded for a PDF and returns one reason per faulty file;
+/// empty when every file is unchanged.
+fn source_problems(root: &Path, sha: &str, aliases: &Value) -> Result<Vec<String>> {
     let names = aliases.as_array().map(Vec::as_slice).unwrap_or_default();
     if names.is_empty() {
-        return Ok(Some("No source PDF file is recorded for this document."));
+        return Ok(vec![
+            "No source PDF file is recorded for this document.".into(),
+        ]);
     }
+    let mut problems = Vec::new();
     for alias in names {
         let name = filename(alias["filename"].as_str().unwrap_or_default())?;
         match fs::read(root.join("source").join(name)) {
-            Err(_) => return Ok(Some("A source PDF file is missing or unreadable.")),
-            Ok(bytes) if hash(&bytes) != sha => {
-                return Ok(Some(
-                    "A source PDF file no longer matches the document hash.",
-                ));
-            }
+            Err(_) => problems.push(format!("Source PDF file {name} is missing or unreadable.")),
+            Ok(bytes) if hash(&bytes) != sha => problems.push(format!(
+                "Source PDF file {name} no longer matches the document hash."
+            )),
             Ok(_) => {}
         }
     }
-    Ok(None)
+    Ok(problems)
 }
 
 /// Only an exact match on a named native page, with every source PDF file unchanged, is
@@ -705,17 +717,17 @@ fn verify_quote(
             "pages":located.into_iter().take(20).collect::<Vec<_>>()})
     };
     let sources: Value = serde_json::from_str(&aliases)?;
-    let mut reasons = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
     if number.is_none() {
-        reasons.push("No page was named; a search only locates candidate pages.");
+        reasons.push("No page was named; a search only locates candidate pages.".into());
     }
     if result["grade"] != "exact" {
-        reasons.push("The quotation is not an exact match.");
+        reasons.push("The quotation is not an exact match.".into());
     }
     if number.is_some() && (result["provenance"] != "native" || result["needs_review"] != false) {
-        reasons.push("The page is OCR text or flagged for review.");
+        reasons.push("The page is OCR text or flagged for review.".into());
     }
-    reasons.extend(source_problem(root, sha, &sources)?);
+    reasons.extend(source_problems(root, sha, &sources)?);
     let verified = reasons.is_empty();
     result["verified"] = json!(verified);
     result["unverified_reasons"] = json!(reasons);
@@ -1037,6 +1049,26 @@ mod tests {
         );
     }
     #[test]
+    fn every_missing_or_replaced_source_file_is_reported() {
+        let (root, connection, sha) = quote_fixture();
+        connection
+            .execute(
+                "UPDATE documents SET aliases='[{\"filename\":\"sample.pdf\"},{\"filename\":\"copy.pdf\"}]'",
+                [],
+            )
+            .unwrap();
+        fs::write(root.join("source/sample.pdf"), b"Replaced fabricated bytes").unwrap();
+        let checked = verify_quote(&root, &connection, &sha, Some(2), "lease liability").unwrap();
+        assert_eq!(checked["verified"], false);
+        assert_eq!(
+            checked["unverified_reasons"],
+            json!([
+                "Source PDF file sample.pdf no longer matches the document hash.",
+                "Source PDF file copy.pdf is missing or unreadable."
+            ])
+        );
+    }
+    #[test]
     fn source_names_cannot_escape_the_snapshot() {
         for name in ["", "..", "../a.pdf", "a/b.pdf", "a\\b.pdf", "C:foo"] {
             assert!(filename(name).is_err());
@@ -1070,20 +1102,27 @@ mod tests {
         assert!(search(&connection, "   ", &QueryOptions::default()).is_err());
         assert!(search(&connection, "\"", &QueryOptions::default()).is_err());
     }
-    #[test]
-    fn paragraph_lookup_requires_an_unchanged_second_reading() {
+    fn paragraph_fixture() -> (Fixture, Connection, String) {
         let root = fixture();
-        let source_manifest = root.join("source/manifest.json");
-        let sources: Sources = read_json(&source_manifest).unwrap();
+        let sources: Sources = read_json(&root.join("source/manifest.json")).unwrap();
         let sha = sources.files[0].sha256.clone();
         let connection = Connection::open_in_memory().unwrap();
         schema(&connection).unwrap();
         let text = "35 A fabricated requirement.\n36 Next requirement.";
         connection
-            .execute("INSERT INTO documents VALUES(?1,1,'[]','[]',?1)", [&sha])
+            .execute(
+                "INSERT INTO documents VALUES(?1,1,'[{\"filename\":\"sample.pdf\"}]','[]',?1)",
+                [&sha],
+            )
             .unwrap();
         connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,1,?2,?3,'native',0)",
             params![sha, text, hash(text.as_bytes())]).unwrap();
+        (root, connection, sha)
+    }
+    #[test]
+    fn paragraph_lookup_requires_an_unchanged_second_reading() {
+        let (root, connection, sha) = paragraph_fixture();
+        let source_manifest = root.join("source/manifest.json");
         let status = || paragraph(&root, &connection, &sha, "35").map(|r| r["status"].clone());
         assert_eq!(status().unwrap(), "found_unconfirmed");
         let folder = root.join("second-reader");
@@ -1133,6 +1172,37 @@ mod tests {
         assert_eq!(status().unwrap(), "found");
         fs::remove_file(folder.join("manifest.json")).unwrap();
         assert!(status().is_err());
+    }
+    #[test]
+    fn a_replaced_or_removed_source_pdf_is_never_confirmed() {
+        let (root, connection, sha) = paragraph_fixture();
+        let folder = root.join("second-reader");
+        fs::create_dir_all(folder.join(&sha)).unwrap();
+        let pages = "{\"page\":1,\"text\":\"35 A fabricated requirement. 36 Next\"}\n";
+        fs::write(folder.join(&sha).join("pages.jsonl"), pages).unwrap();
+        let manifest = json!({"schema_version":1,"reader":"pypdf","reader_version":"0-test",
+            "source_manifest_sha256":file_hash(&root.join("source/manifest.json")).unwrap(),
+            "documents":[{"sha256":sha,"page_count":1,"pages_sha256":hash(pages.as_bytes())}],
+            "failures":[]});
+        fs::write(folder.join("manifest.json"), manifest.to_string()).unwrap();
+        let lookup = || paragraph(&root, &connection, &sha, "35").unwrap();
+        assert_eq!(lookup()["status"], "found");
+        let source = root.join("source/sample.pdf");
+        fs::write(&source, b"Replaced fabricated bytes").unwrap();
+        let replaced = lookup();
+        assert_eq!(replaced["status"], "found_unconfirmed");
+        assert_eq!(replaced["second_reader"]["status"], "source_changed");
+        assert_eq!(
+            replaced["second_reader"]["reasons"],
+            json!(["Source PDF file sample.pdf no longer matches the document hash."])
+        );
+        fs::remove_file(&source).unwrap();
+        let removed = lookup();
+        assert_eq!(removed["status"], "found_unconfirmed");
+        assert_eq!(
+            removed["second_reader"]["reasons"],
+            json!(["Source PDF file sample.pdf is missing or unreadable."])
+        );
     }
     #[test]
     fn whitespace_pages_are_counted_for_review() {

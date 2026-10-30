@@ -290,7 +290,8 @@ fn contiguous(fragment: &str, reading: &str) -> bool {
 }
 
 /// Confirms a `found` paragraph against an independent reading of the same PDF pages.
-/// Without that reading the status becomes `found_unconfirmed`; a mismatch needs review.
+/// Without that reading the status becomes `found_unconfirmed`; a mismatch or a fragment
+/// without words needs review.
 /// A found result without fragments, fragment text or physical pages is an error.
 pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)>) -> Result<()> {
     if result["status"] != "found" {
@@ -310,6 +311,18 @@ pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)
     }
     if fragments.is_empty() {
         return Err("found paragraph has no fragments".into());
+    }
+    if fragments.iter().any(|(text, _)| tokens(text).is_empty()) {
+        let candidate = &mut result["candidates"][0];
+        candidate["needs_review"] = json!(true);
+        if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
+            reasons.push(json!(
+                "A fragment has no words for a second reader to confirm."
+            ));
+        }
+        result["status"] = json!("needs_review");
+        result["second_reader"] = json!({"status":"not_checked"});
+        return Ok(());
     }
     let Some((reader, pages)) = reading else {
         result["status"] = json!("found_unconfirmed");
@@ -447,6 +460,15 @@ mod tests {
         blank["candidates"][0]["fragments"][0]["text"] = json!("--");
         confirm(&mut blank, Some(&reading)).unwrap();
         assert_eq!(blank["status"], "needs_review");
+    }
+
+    #[test]
+    fn wordless_fragments_need_review_without_a_reading() {
+        let mut blank = lookup(&[page(1, "35 A fabricated requirement.\n36 Next.")], "35").unwrap();
+        blank["candidates"][0]["fragments"][0]["text"] = json!("--");
+        confirm(&mut blank, None).unwrap();
+        assert_eq!(blank["status"], "needs_review");
+        assert_eq!(blank["candidates"][0]["needs_review"], true);
     }
 
     #[test]
