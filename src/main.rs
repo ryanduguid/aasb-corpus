@@ -496,9 +496,16 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
 
 #[derive(Deserialize)]
 struct SecondReader {
+    schema_version: u32,
     reader: String,
     reader_version: String,
+    source_manifest_sha256: String,
     documents: Vec<Document>,
+    failures: Vec<ReaderFailure>,
+}
+#[derive(Deserialize)]
+struct ReaderFailure {
+    sha256: String,
 }
 #[derive(Deserialize)]
 struct Reading {
@@ -506,21 +513,46 @@ struct Reading {
     text: String,
 }
 
-/// Loads one PDF's independent page texts from `tools/second_reader.py`, or `None` when
-/// that PDF has no second reading. Changed or incomplete readings are errors.
+/// Loads one PDF's independent page texts from `tools/second_reader.py`. `None` means the
+/// snapshot has no `second-reader` folder or pypdf's failure on this PDF is recorded; a
+/// changed, stale, incomplete or unknown reading is an error.
 fn second_reading(
     root: &Path,
     sha: &str,
     page_count: usize,
 ) -> Result<Option<(String, Vec<String>)>> {
     let folder = root.join("second-reader");
-    if !folder.join("manifest.json").exists() {
+    if !folder.exists() {
         return Ok(None);
     }
     let manifest: SecondReader = read_json(&folder.join("manifest.json"))?;
-    let Some(document) = manifest.documents.iter().find(|d| d.sha256 == sha) else {
+    if manifest.schema_version != 1
+        || manifest.reader != "pypdf"
+        || manifest.reader_version.trim().is_empty()
+    {
+        return Err("unsupported second-reader manifest".into());
+    }
+    let source_path = root.join("source/manifest.json");
+    if file_hash(&source_path)? != manifest.source_manifest_sha256 {
+        return Err("second reading was made from a different source manifest".into());
+    }
+    let sources: Sources = read_json(&source_path)?;
+    let expected: std::collections::BTreeSet<_> =
+        sources.files.iter().map(|s| s.sha256.as_str()).collect();
+    let mut covered = std::collections::BTreeSet::new();
+    let recorded = manifest.documents.iter().map(|d| d.sha256.as_str());
+    let failed = manifest.failures.iter().map(|f| f.sha256.as_str());
+    if !recorded.chain(failed).all(|digest| covered.insert(digest)) || covered != expected {
+        return Err("second reading does not cover each source document exactly once".into());
+    }
+    if manifest.failures.iter().any(|f| f.sha256 == sha) {
         return Ok(None);
-    };
+    }
+    let document = manifest
+        .documents
+        .iter()
+        .find(|d| d.sha256 == sha)
+        .ok_or("document is not in the second reading")?;
     let bytes = fs::read(folder.join(sha).join("pages.jsonl"))?;
     if hash(&bytes) != document.pages_sha256 {
         return Err("second-reader pages changed".into());
@@ -566,7 +598,7 @@ fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Re
     } else {
         None
     };
-    paragraphs::confirm(&mut result, reading.as_ref());
+    paragraphs::confirm(&mut result, reading.as_ref())?;
     result["document_sha256"] = json!(sha);
     result["sources"] = serde_json::from_str(&aliases)?;
     result["version_metadata"] = serde_json::from_str(&metadata)?;
@@ -596,9 +628,31 @@ fn page(connection: &Connection, sha: &str, number: u32) -> Result<Value> {
     )
 }
 
-/// Only an exact match on a named native page is verified; a search without a page,
-/// normalised or partial grades and OCR or review pages only locate candidates.
+/// Rehashes each source file recorded for a PDF; `None` when every file is unchanged.
+fn source_problem(root: &Path, sha: &str, aliases: &Value) -> Result<Option<&'static str>> {
+    let names = aliases.as_array().map(Vec::as_slice).unwrap_or_default();
+    if names.is_empty() {
+        return Ok(Some("No source PDF file is recorded for this document."));
+    }
+    for alias in names {
+        let name = filename(alias["filename"].as_str().unwrap_or_default())?;
+        match fs::read(root.join("source").join(name)) {
+            Err(_) => return Ok(Some("A source PDF file is missing or unreadable.")),
+            Ok(bytes) if hash(&bytes) != sha => {
+                return Ok(Some(
+                    "A source PDF file no longer matches the document hash.",
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Only an exact match on a named native page, with every source PDF file unchanged, is
+/// verified; `unverified_reasons` lists every condition that is not met.
 fn verify_quote(
+    root: &Path,
     connection: &Connection,
     sha: &str,
     number: Option<u32>,
@@ -650,18 +704,28 @@ fn verify_quote(
             "located_page_count":located.len(),"pages_truncated":located.len() > 20,
             "pages":located.into_iter().take(20).collect::<Vec<_>>()})
     };
-    let verified = number.is_some()
-        && result["grade"] == "exact"
-        && result["provenance"] == "native"
-        && result["needs_review"] == false;
+    let sources: Value = serde_json::from_str(&aliases)?;
+    let mut reasons = Vec::new();
+    if number.is_none() {
+        reasons.push("No page was named; a search only locates candidate pages.");
+    }
+    if result["grade"] != "exact" {
+        reasons.push("The quotation is not an exact match.");
+    }
+    if number.is_some() && (result["provenance"] != "native" || result["needs_review"] != false) {
+        reasons.push("The page is OCR text or flagged for review.");
+    }
+    reasons.extend(source_problem(root, sha, &sources)?);
+    let verified = reasons.is_empty();
     result["verified"] = json!(verified);
+    result["unverified_reasons"] = json!(reasons);
     // Retained for existing callers, with the stricter meaning.
     result["matches"] = json!(verified);
     result["document_sha256"] = json!(sha);
-    result["sources"] = serde_json::from_str(&aliases)?;
+    result["sources"] = sources;
     result["version_metadata"] = serde_json::from_str(&metadata)?;
     result["boundary"] = json!(
-        "Only an exact match on a named native page of the selected PDF is verified. Normalised and partial grades, OCR or review pages and searches without a page locate candidates for review. A text match does not establish accounting applicability."
+        "Only an exact match on a named native page of the selected PDF, with its source files unchanged, is verified. Normalised and partial grades, OCR or review pages and searches without a page locate candidates for review. A text match does not establish accounting applicability."
     );
     Ok(result)
 }
@@ -742,9 +806,10 @@ fn run() -> Result<Value> {
         "page" if arguments.len() == 4 => page(&connection, &arguments[2], arguments[3].parse()?),
         "verify" if arguments.len() == 2 => verify(root, &connection),
         "verify-quote" if arguments.len() == 4 => {
-            verify_quote(&connection, &arguments[2], None, &arguments[3])
+            verify_quote(root, &connection, &arguments[2], None, &arguments[3])
         }
         "verify-quote" if arguments.len() == 5 => verify_quote(
+            root,
             &connection,
             &arguments[2],
             Some(arguments[3].parse()?),
@@ -884,12 +949,18 @@ mod tests {
         assert_eq!(grade("the lease liability differs", text), "none");
     }
 
-    fn quote_fixture() -> (Connection, String) {
+    /// Fixture snapshot whose only source PDF is indexed with 3 fabricated pages.
+    fn quote_fixture() -> (Fixture, Connection, String) {
+        let root = fixture();
+        let sources: Sources = read_json(&root.join("source/manifest.json")).unwrap();
+        let sha = sources.files[0].sha256.clone();
         let connection = Connection::open_in_memory().unwrap();
         schema(&connection).unwrap();
-        let sha = "e".repeat(64);
         connection
-            .execute("INSERT INTO documents VALUES(?1,3,'[]','[]',?1)", [&sha])
+            .execute(
+                "INSERT INTO documents VALUES(?1,3,'[{\"filename\":\"sample.pdf\"}]','[]',?1)",
+                [&sha],
+            )
             .unwrap();
         for (number, text, provenance) in [
             (1, "A fabricated lease\nliability is measured.", "native"),
@@ -899,15 +970,17 @@ mod tests {
             connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![sha,number,text,hash(text.as_bytes()),provenance,provenance == "ocr"]).unwrap();
         }
-        (connection, sha)
+        (root, connection, sha)
     }
     #[test]
     fn only_exact_matches_on_a_named_native_page_are_verified() {
-        let (connection, sha) = quote_fixture();
+        let (root, connection, sha) = quote_fixture();
+        let verify_quote = |page, quote| verify_quote(&root, &connection, &sha, page, quote);
         let quote = "fabricated lease liability";
-        let exact = verify_quote(&connection, &sha, Some(2), quote).unwrap();
+        let exact = verify_quote(Some(2), quote).unwrap();
         assert_eq!(exact["grade"], "exact");
         assert_eq!(exact["verified"], true);
+        assert_eq!(exact["unverified_reasons"], json!([]));
         assert_eq!(exact["matches"], true);
         assert_eq!(exact["pdf_page"], 2);
         assert_eq!(
@@ -916,24 +989,52 @@ mod tests {
         );
         assert_eq!(exact["document_sha256"], sha);
         for (page, grade) in [(1, "normalised"), (3, "exact")] {
-            let found = verify_quote(&connection, &sha, Some(page), quote).unwrap();
+            let found = verify_quote(Some(page), quote).unwrap();
             assert_eq!(found["grade"], grade);
             assert_eq!(found["verified"], false);
             assert_eq!(found["matches"], false);
+            assert_eq!(found["unverified_reasons"].as_array().unwrap().len(), 1);
         }
-        let searched = verify_quote(&connection, &sha, None, quote).unwrap();
+        let searched = verify_quote(None, quote).unwrap();
         assert_eq!(searched["grade"], "exact");
         assert_eq!(searched["verified"], false);
         assert_eq!(searched["located_page_count"], 2);
         assert_eq!(searched["pages"][0]["pdf_page"], 2);
-        let missing = verify_quote(&connection, &sha, None, "an unrelated quotation").unwrap();
+        let missing = verify_quote(None, "an unrelated quotation").unwrap();
         assert_eq!(missing["grade"], "none");
         assert_eq!(missing["pages"], json!([]));
-        assert!(verify_quote(&connection, &sha, Some(4), quote).is_err());
+        assert!(verify_quote(Some(4), quote).is_err());
         connection
             .execute("UPDATE pages SET text='changed' WHERE page=2", [])
             .unwrap();
-        assert!(verify_quote(&connection, &sha, Some(2), quote).is_err());
+        assert!(verify_quote(Some(2), quote).is_err());
+    }
+    #[test]
+    fn a_missing_or_replaced_source_pdf_is_never_verified() {
+        let (root, connection, sha) = quote_fixture();
+        let checked =
+            || verify_quote(&root, &connection, &sha, Some(2), "lease liability").unwrap();
+        assert_eq!(checked()["verified"], true);
+        let source = root.join("source/sample.pdf");
+        fs::write(&source, b"Replaced fabricated bytes").unwrap();
+        let replaced = checked();
+        assert_eq!(replaced["verified"], false);
+        assert_eq!(replaced["matches"], false);
+        assert!(
+            replaced["unverified_reasons"][0]
+                .as_str()
+                .unwrap()
+                .contains("no longer matches")
+        );
+        fs::remove_file(&source).unwrap();
+        let removed = checked();
+        assert_eq!(removed["verified"], false);
+        assert!(
+            removed["unverified_reasons"][0]
+                .as_str()
+                .unwrap()
+                .contains("missing")
+        );
     }
     #[test]
     fn source_names_cannot_escape_the_snapshot() {
@@ -972,9 +1073,11 @@ mod tests {
     #[test]
     fn paragraph_lookup_requires_an_unchanged_second_reading() {
         let root = fixture();
+        let source_manifest = root.join("source/manifest.json");
+        let sources: Sources = read_json(&source_manifest).unwrap();
+        let sha = sources.files[0].sha256.clone();
         let connection = Connection::open_in_memory().unwrap();
         schema(&connection).unwrap();
-        let sha = "f".repeat(64);
         let text = "35 A fabricated requirement.\n36 Next requirement.";
         connection
             .execute("INSERT INTO documents VALUES(?1,1,'[]','[]',?1)", [&sha])
@@ -985,22 +1088,50 @@ mod tests {
         assert_eq!(status().unwrap(), "found_unconfirmed");
         let folder = root.join("second-reader");
         fs::create_dir_all(folder.join(&sha)).unwrap();
-        let write = |pages: &str, digest: &str| {
+        let entry = |digest: &str| json!([{"sha256":sha,"page_count":1,"pages_sha256":digest}]);
+        let write = |pages: &str, change: &dyn Fn(&mut Value)| {
             fs::write(folder.join(&sha).join("pages.jsonl"), pages).unwrap();
-            let manifest = json!({"reader":"fabricated","reader_version":"1",
-                "documents":[{"sha256":sha,"page_count":1,"pages_sha256":digest}]});
+            let mut manifest = json!({"schema_version":1,"reader":"pypdf","reader_version":"0-test",
+                "source_manifest_sha256":file_hash(&source_manifest).unwrap(),
+                "documents":entry(&hash(pages.as_bytes())),"failures":[]});
+            change(&mut manifest);
             fs::write(folder.join("manifest.json"), manifest.to_string()).unwrap();
         };
         let reading = "{\"page\":1,\"text\":\"35 A fabri cated requirement. 36 Next\"}\n";
-        write(reading, &hash(reading.as_bytes()));
+        write(reading, &|_| {});
         assert_eq!(status().unwrap(), "found");
         let other = "{\"page\":1,\"text\":\"35 Another requirement. 36 Next\"}\n";
-        write(other, &hash(other.as_bytes()));
+        write(other, &|_| {});
         assert_eq!(status().unwrap(), "needs_review");
-        write(other, &hash(reading.as_bytes()));
-        assert!(status().is_err());
+        // A recorded pypdf failure for this PDF is the only other unavailable case.
+        write(reading, &|m| {
+            m["documents"] = json!([]);
+            m["failures"] = json!([{"filename":"sample.pdf","sha256":sha,"error":"fabricated"}]);
+        });
+        assert_eq!(status().unwrap(), "found_unconfirmed");
+        let stale: [&dyn Fn(&mut Value); 7] = [
+            &|m| m["documents"] = entry(&hash(other.as_bytes())),
+            &|m| m["documents"] = json!([]),
+            &|m| m["failures"] = json!([{"sha256":sha}]),
+            &|m| m["schema_version"] = json!(2),
+            &|m| m["reader"] = json!("another reader"),
+            &|m| m["source_manifest_sha256"] = json!("0".repeat(64)),
+            &|m| m["documents"][0]["page_count"] = json!(2),
+        ];
+        for change in stale {
+            write(reading, change);
+            assert!(status().is_err());
+        }
         let two = format!("{reading}{{\"page\":2,\"text\":\"\"}}\n");
-        write(&two, &hash(two.as_bytes()));
+        write(&two, &|_| {});
+        assert!(status().is_err());
+        write(reading, &|_| {});
+        let original = fs::read(&source_manifest).unwrap();
+        fs::write(&source_manifest, [original.as_slice(), b" "].concat()).unwrap();
+        assert!(status().is_err());
+        fs::write(&source_manifest, original).unwrap();
+        assert_eq!(status().unwrap(), "found");
+        fs::remove_file(folder.join("manifest.json")).unwrap();
         assert!(status().is_err());
     }
     #[test]
