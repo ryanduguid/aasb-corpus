@@ -61,6 +61,18 @@ fn reference_footnote(line: &str) -> bool {
 
 fn heading(line: &str) -> bool {
     let line = line.trim();
+    // PDF typography can promote lettered clauses and nested Roman clauses
+    // to headings. They still belong to the numbered parent paragraph.
+    if plain_start(line)
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+        .is_some_and(|(label, _)| {
+            (label.len() == 1 && label.as_bytes()[0].is_ascii_lowercase())
+                || matches!(label, "ii" | "iii" | "iv" | "vi" | "vii" | "viii" | "ix")
+        })
+    {
+        return false;
+    }
     let plain = line.trim_matches('*');
     line.starts_with('#')
         || plain.starts_with("Appendix ")
@@ -599,6 +611,28 @@ mod tests {
             .unwrap()["status"],
             "needs_review"
         );
+    }
+
+    #[test]
+    fn heading_markup_on_subparagraphs_keeps_the_parent_complete() {
+        for text in [
+            "## 67 Fabricated requirement:\n\n## (a) First condition\n\n## (b) Second condition\n\n68 Next requirement.",
+            "67 Fabricated requirement:\n**(a) First condition**\n**(b) Second condition**\n**(iv) Nested condition**\n68 Next requirement.",
+        ] {
+            let found = lookup(&[page(1, text)], "67").unwrap();
+            assert_eq!(found["status"], "found");
+            assert_eq!(found["candidates"][0]["next_paragraph"], "68");
+            let retained = found["candidates"][0]["fragments"][0]["text"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                retained,
+                text.split("\n68 Next requirement.")
+                    .next()
+                    .unwrap()
+                    .trim_end()
+            );
+        }
     }
 
     #[test]
