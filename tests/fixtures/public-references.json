@@ -1,0 +1,41 @@
+{
+  "scope": "Official AASB116 source identities and independently observed physical PDF pages; no redistributed standard text or applicability conclusion",
+  "standard": "AASB 116",
+  "principal_id": "F2015L01572",
+  "authorised_id": "F2023C00192",
+  "compilation": 6,
+  "compilation_date": "2022-12-31",
+  "source_url": "https://www.legislation.gov.au/F2015L01572/2022-12-31/2022-12-31/text/original/pdf",
+  "standard_url": "https://standards.aasb.gov.au/aasb-116-dec-2022",
+  "sha256": "0646458b6cfaba125fbadc1cd9b27c72067d0d82e2ff580aa2f48a31dcee3183",
+  "page_count": 23,
+  "paragraphs": [
+    {
+      "number": "7",
+      "page": 6,
+      "next": "8",
+      "conditions": true
+    },
+    {
+      "number": "12",
+      "page": 7,
+      "next": "13"
+    },
+    {
+      "number": "30",
+      "page": 10,
+      "next": "31"
+    },
+    {
+      "number": "51",
+      "page": 12,
+      "next": "52"
+    },
+    {
+      "number": "67",
+      "page": 14,
+      "next": "68",
+      "conditions": true
+    }
+  ]
+}
