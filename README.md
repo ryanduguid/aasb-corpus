@@ -19,7 +19,7 @@ The index uses whole PDF pages. Citations use physical PDF page numbers, which c
 From this code directory, build the Windows executable:
 
 ```powershell
-rtk cargo build --locked --release
+cargo build --locked --release
 ```
 
 Search locally:
@@ -113,16 +113,16 @@ On the Linux sandbox, use `agent-run pdf-inspector-python tools/extract.py SNAPS
 ## Checks
 
 ```powershell
-rtk cargo fmt --check
-rtk cargo test --locked
-rtk cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 & 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 -m unittest discover -s tools -p 'test_*.py'
 ```
 
 The optional live-index check traverses filtered results and checks actual paragraph fragments against indexed page slices. On Linux, set `AASB_TEST_SNAPSHOT` to the local snapshot and run:
 
 ```sh
-AASB_TEST_SNAPSHOT=/path/to/snapshot rtk cargo test --locked --test local_snapshot -- --ignored --nocapture
+AASB_TEST_SNAPSHOT=/path/to/snapshot cargo test --locked --test local_snapshot -- --ignored --nocapture
 ```
 
 Ordinary tests use fabricated text. The live check stays local and prints counts and statuses only.
