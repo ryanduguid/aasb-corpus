@@ -72,7 +72,7 @@ The second reader is pypdf, a PDF parser independent of pdf-inspector that is in
 
 Once `second-reader/` exists, its manifest must have the supported schema and reader, the digest of the current source manifest, and exactly one document or recorded failure for each source PDF; each reading must match its digest and cover every page. Anything else, including a missing manifest, is an error rather than `found_unconfirmed`. So is a found result without fragment text or physical pages.
 
-Only treat `found` as a located source span; the accounting conclusion remains separate. Lookup excludes recognised contents pages, bounds output to 20 candidates and withholds candidate text above 64 KiB while preserving page references. Unsupported layouts require reading the cited PDF pages. No general PDF-layout accuracy is claimed.
+Only treat `found` as a located source span; the accounting conclusion remains separate. Lookup excludes recognised contents pages, bounds output to 20 candidates and withholds candidate text above 64 KiB whilst preserving page references. Unsupported layouts require reading the cited PDF pages. No general PDF-layout accuracy is claimed.
 
 `page SNAPSHOT SHA256 PAGE` returns a full extracted page.
 
