@@ -221,3 +221,52 @@ fn fabricated_versions_and_near_identifiers_have_exact_references() {
         assert_eq!(paragraph["second_reader"]["status"], "confirmed");
     }
 }
+
+/// README: 'No command uploads documents, calls a model provider or downloads
+/// content.' `strace -f` sees any network syscall, from any library or child
+/// process, on one run of every command. That proves these runs, not unexercised
+/// paths. Without strace the test skips with a message.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_command_makes_no_network_syscall() {
+    if Command::new("strace").arg("-V").output().is_err() {
+        eprintln!("skipped: strace is not installed");
+        return;
+    }
+    let fixture = Fixture::new();
+    let root = fixture.0.to_str().unwrap();
+    let sha = hash(&source("new"));
+    let log = fixture.0.join("no_network.strace");
+    let log = log.to_str().unwrap();
+    for command in [
+        vec!["build", root],
+        vec!["stats", root],
+        vec!["catalogue", root],
+        vec!["search", root, "lease"],
+        vec!["paragraph", root, &sha, "26"],
+        vec!["page", root, &sha, "1"],
+        vec!["verify", root],
+        vec!["verify-quote", root, &sha, "1", "Fabricated cobalt"],
+    ] {
+        let output = Command::new("strace")
+            .args(["-f", "-qq", "-e", "trace=%network,execve", "-o", log])
+            .arg(env!("CARGO_BIN_EXE_aasb-corpus"))
+            .args(&command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The binary's own execve shows the tracer was attached; anything more is
+        // a network syscall or a child process.
+        let trace = fs::read_to_string(log).unwrap();
+        let calls: Vec<&str> = trace.lines().collect();
+        assert_eq!(calls.len(), 1, "{}: {trace}", command[0]);
+        assert!(
+            calls[0].contains("execve(") && calls[0].ends_with("= 0"),
+            "{trace}"
+        );
+    }
+}
