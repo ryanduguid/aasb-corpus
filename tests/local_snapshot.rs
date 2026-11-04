@@ -140,3 +140,90 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
         all.len()
     );
 }
+
+/// Whether a search's first `limit` results include one of `pages` of document `sha`.
+fn ranked(root: &str, query: &str, sha: &str, pages: &BTreeSet<u64>, stem: bool) -> [bool; 2] {
+    let mut arguments = vec![query, "--version", sha, "--limit", "20"];
+    if stem {
+        arguments.push("--stem");
+    }
+    let found = call(root, "search", &arguments);
+    let hits: Vec<u64> = found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["pdf_page"].as_u64().unwrap())
+        .collect();
+    [5, 20].map(|limit| hits.iter().take(limit).any(|page| pages.contains(page)))
+}
+
+/// Counts only: the fixture holds short queries and labels, and nothing prints page text.
+#[test]
+#[ignore = "requires AASB_TEST_SNAPSHOT pointing to a local captured index"]
+fn reference_questions_on_the_local_snapshot() {
+    let root = std::env::var("AASB_TEST_SNAPSHOT").expect("set AASB_TEST_SNAPSHOT");
+    let index = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&root).join("index.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let version: i64 = index
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let modes: &[bool] = if version >= 2 {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let questions = include_str!("fixtures/reference-questions.tsv");
+    let mut statuses = std::collections::BTreeMap::<String, usize>::new();
+    let mut located = 0;
+    let mut counts = [[0; 2]; 2];
+    for line in questions.lines().filter(|line| !line.starts_with('#')) {
+        let [query, standard, label] = line.split('\t').collect::<Vec<_>>()[..] else {
+            panic!("expected query, standard and paragraph: {line}");
+        };
+        let catalogue = call(
+            &root,
+            "catalogue",
+            &["--standard", standard, "--limit", "100"],
+        );
+        let documents = catalogue["results"].as_array().unwrap();
+        assert!(!documents.is_empty(), "no document for {standard}");
+        for document in documents {
+            let sha = document["document_sha256"].as_str().unwrap();
+            let found = call(&root, "paragraph", &[sha, label]);
+            let status = found["status"].as_str().unwrap().to_owned();
+            let pages: BTreeSet<u64> = found["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|candidate| candidate["fragments"].as_array().unwrap())
+                .map(|fragment| fragment["pdf_page"].as_u64().unwrap())
+                .collect();
+            *statuses.entry(status).or_default() += 1;
+            if pages.is_empty() {
+                continue;
+            }
+            located += 1;
+            for (mode, stem) in modes.iter().enumerate() {
+                let hits = ranked(&root, query, sha, &pages, *stem);
+                for (rank, hit) in hits.iter().enumerate() {
+                    counts[mode][rank] += usize::from(*hit);
+                }
+            }
+        }
+    }
+    assert!(located > 0);
+    println!(
+        "reference questions: {} questions; {located} located paragraph versions; statuses={statuses:?}",
+        questions
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .count()
+    );
+    println!("exact: top5={} top20={}", counts[0][0], counts[0][1]);
+    if modes.len() == 2 {
+        println!("stemmed: top5={} top20={}", counts[1][0], counts[1][1]);
+    }
+}

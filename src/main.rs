@@ -156,7 +156,9 @@ fn schema(connection: &Connection) -> Result<()> {
             provenance TEXT NOT NULL, needs_review INTEGER NOT NULL,
             UNIQUE(document_sha256,page));
         CREATE VIRTUAL TABLE pages_fts USING fts5(text, content='pages', content_rowid='id');
-        PRAGMA user_version=1;
+        CREATE VIRTUAL TABLE pages_stem USING fts5(text, content='pages', content_rowid='id',
+            tokenize='porter unicode61');
+        PRAGMA user_version=2;
     ")?;
     Ok(())
 }
@@ -271,11 +273,16 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
             return Err("page coverage differs or extraction changed during indexing".into());
         }
     }
-    transaction.execute("INSERT INTO pages_fts(pages_fts) VALUES('rebuild')", [])?;
-    transaction.execute(
-        "INSERT INTO pages_fts(pages_fts) VALUES('integrity-check')",
-        [],
-    )?;
+    for table in ["pages_fts", "pages_stem"] {
+        transaction.execute(
+            &format!("INSERT INTO {table}({table}) VALUES('rebuild')"),
+            [],
+        )?;
+        transaction.execute(
+            &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
+            [],
+        )?;
+    }
     transaction.commit()?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -288,11 +295,15 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
     )
 }
 
+fn schema_version(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
 fn open(root: &Path) -> Result<Connection> {
     let connection =
         Connection::open_with_flags(root.join("index.sqlite3"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 1 {
+    // Version 1 lacks only the stem table, so its indexes and their digests stay usable.
+    if !(1..=2).contains(&schema_version(&connection)?) {
         return Err("unsupported corpus schema".into());
     }
     Ok(connection)
@@ -319,6 +330,7 @@ struct QueryOptions {
     version: Option<String>,
     limit: u32,
     offset: i64,
+    stem: bool,
 }
 
 impl Default for QueryOptions {
@@ -328,6 +340,7 @@ impl Default for QueryOptions {
             version: None,
             limit: 20,
             offset: 0,
+            stem: false,
         }
     }
 }
@@ -445,6 +458,11 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     if query.trim().is_empty() {
         return Err("search query must not be blank".into());
     }
+    let stem = options.stem;
+    if stem && schema_version(connection)? < 2 {
+        return Err("this index has no stem table; rebuild it as the README describes".into());
+    }
+    let table = if stem { "pages_stem" } else { "pages_fts" };
     let selected = if options.standard.is_some() || options.version.is_some() {
         let documents: Vec<_> = matching_documents(connection, options)?
             .into_iter()
@@ -454,15 +472,15 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     } else {
         None
     };
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT p.document_sha256,p.page,
-        snippet(pages_fts,0,'[',']',' … ',40),p.provenance,p.needs_review,d.aliases,d.metadata
-        FROM pages_fts JOIN pages p ON p.id=pages_fts.rowid
+        snippet({table},0,'[',']',' … ',40),p.provenance,p.needs_review,d.aliases,d.metadata
+        FROM {table} JOIN pages p ON p.id={table}.rowid
         JOIN documents d ON d.sha256=p.document_sha256
-        WHERE pages_fts MATCH ?1
+        WHERE {table} MATCH ?1
         AND (?2 IS NULL OR p.document_sha256 IN (SELECT value FROM json_each(?2)))
-        ORDER BY bm25(pages_fts),p.document_sha256,p.page LIMIT ?3 OFFSET ?4",
-    )?;
+        ORDER BY bm25({table}),p.document_sha256,p.page LIMIT ?3 OFFSET ?4"
+    ))?;
     let rows = statement.query_map(
         params![query, selected, options.limit + 1, options.offset],
         |row| {
@@ -486,12 +504,17 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     }
     let has_more = hits.len() > options.limit as usize;
     hits.truncate(options.limit as usize);
-    Ok(
-        json!({"query":query,"results":hits,"limit":options.limit,"offset":options.offset,
+    let mut result = json!({"query":query,"results":hits,"limit":options.limit,"offset":options.offset,
         "filters":options.filters(),"has_more":has_more,
         "next_offset":has_more.then_some(options.offset + i64::from(options.limit)),
-        "boundary":"Search covers captured versions; it does not determine reporting-period applicability."}),
-    )
+        "boundary":"Search covers captured versions; it does not determine reporting-period applicability."});
+    if stem {
+        result["stemmed"] = json!(true);
+        result["stem_boundary"] = json!(
+            "Stemmed hits match word forms, not the query's words. Check any quotation with verify-quote."
+        );
+    }
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -807,11 +830,16 @@ fn run() -> Result<Value> {
     match arguments[0].as_str() {
         "stats" if arguments.len() == 2 => stats(&connection),
         "catalogue" => catalogue(&connection, &QueryOptions::parse(&arguments[2..])?),
-        "search" if arguments.len() >= 3 => search(
-            &connection,
-            &arguments[2],
-            &QueryOptions::parse(&arguments[3..])?,
-        ),
+        "search" if arguments.len() >= 3 => {
+            let mut options = arguments[3..].to_vec();
+            let stem = options.iter().position(|option| option == "--stem");
+            if let Some(position) = stem {
+                options.remove(position);
+            }
+            let mut options = QueryOptions::parse(&options)?;
+            options.stem = stem.is_some();
+            search(&connection, &arguments[2], &options)
+        }
         "paragraph" if arguments.len() == 4 => {
             paragraph(root, &connection, &arguments[2], &arguments[3])
         }

@@ -32,7 +32,9 @@ Search locally:
 
 `verify` also prints `index_sha256`, the digest of `index.sqlite3` to retain with any citation.
 
-`search` accepts SQLite FTS5 query syntax and returns 20 ranked results by default. `--limit` accepts 1 to 100 and `--offset` starts at zero. Results include `has_more` and `next_offset`; continue with that offset and the same query, filters and unchanged snapshot. Ordering is by search rank, document hash and physical page.
+`search` accepts SQLite FTS5 query syntax and matches the words as written; `--stem` also matches other forms of each word, so `leases` finds `leased`. It returns 20 ranked results by default. `--limit` accepts 1 to 100 and `--offset` starts at zero. Results include `has_more` and `next_offset`; continue with that offset and the same query, filters and unchanged snapshot. Ordering is by search rank, document hash and physical page.
+
+A stemmed search finds candidates; its results carry `stemmed` and `stem_boundary`, and any quotation still goes through `verify-quote`. `--stem` needs an index built with the stem table. An older index keeps working for exact search and stops `--stem` with an error. To add the table, move `index.sqlite3` out of the snapshot, run `build`, run `verify` and keep the new `index_sha256`: citations made against the old index keep the old digest, so keep that file too.
 
 ### Choose a standard and PDF version
 
@@ -126,6 +128,8 @@ AASB_TEST_SNAPSHOT=/path/to/snapshot cargo test --locked --test local_snapshot -
 ```
 
 Ordinary tests use fabricated text. The live check stays local and prints counts and statuses only.
+
+The same command also runs the reference questions in `tests/fixtures/reference-questions.tsv`: for each question it looks up the expected paragraph in every version of the standard, then counts how often exact and stemmed search put that paragraph's page in the top 5 and top 20. An index without the stem table counts exact search only. The counts measure this question set, not general recall, and the file holds only short queries and paragraph labels.
 
 ## Reuse and licence
 
