@@ -221,3 +221,73 @@ fn fabricated_versions_and_near_identifiers_have_exact_references() {
         assert_eq!(paragraph["second_reader"]["status"], "confirmed");
     }
 }
+
+#[test]
+fn stemmed_search_finds_other_word_forms_and_exact_search_does_not() {
+    let fixture = Fixture::new();
+    fixture.call("build", &[]);
+    let exact = fixture.call("search", &["leases"]);
+    assert_eq!(exact["results"].as_array().unwrap().len(), 0);
+    assert!(exact.get("stemmed").is_none());
+    let stemmed = fixture.call("search", &["leases", "--stem"]);
+    assert_eq!(stemmed["results"].as_array().unwrap().len(), 3);
+    assert_eq!(stemmed["stemmed"], true);
+    assert!(
+        stemmed["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("[lease]")
+    );
+    let filtered = fixture.call("search", &["leases", "--standard", "AASB 1", "--stem"]);
+    assert_eq!(
+        identities(&filtered),
+        BTreeSet::from([hash(&source("decoy"))])
+    );
+    assert_eq!(
+        fixture.call("search", &["lease"])["results"],
+        fixture.call("search", &["lease", "--stem"])["results"],
+    );
+}
+
+#[test]
+fn an_older_index_keeps_exact_search_and_refuses_stemming() {
+    let fixture = Fixture::new();
+    fixture.call("build", &[]);
+    let index = fixture.0.join("index.sqlite3");
+    let connection = rusqlite::Connection::open(&index).unwrap();
+    connection
+        .execute_batch("DROP TABLE pages_stem; PRAGMA user_version=1;")
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        fixture.call("search", &["lease"])["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
+        .args(["search", fixture.0.to_str().unwrap(), "lease", "--stem"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no stem table"));
+}
+
+#[test]
+fn stem_is_a_search_flag_with_no_value_and_only_one_use() {
+    let fixture = Fixture::new();
+    fixture.call("build", &[]);
+    let root = fixture.0.to_str().unwrap();
+    for arguments in [
+        vec!["search", root, "lease", "--stem", "--stem"],
+        vec!["search", root, "lease", "--stem", "yes"],
+        vec!["catalogue", root, "--stem"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{arguments:?}");
+    }
+}
