@@ -131,8 +131,10 @@ Ordinary tests use fabricated text. The live check stays local and prints counts
 
 The same command also runs the reference questions in `tests/fixtures/reference-questions.tsv`: for each question it looks up the expected paragraph in every version of the standard, then counts how often exact and stemmed search put that paragraph's page in the top 5 and top 20. An index without the stem table counts exact search only. The counts measure this question set, not general recall, and the file holds only short queries and paragraph labels.
 
+On 13 November 2026 the `2026-10-15` snapshot (`index_sha256` `114641a50b25524d217fcbd143b6b36bd03472f80d5b6d29f321b152965f88dc`) gave these counts for the 28 questions. The 81 paragraph lookups, one for each version of each question's standard, were 46 `found`, 6 `ambiguous`, 22 `needs_review` and 7 `not_found`. 74 of them located a page, and exact search put that page in the top 5 for 46 and in the top 20 for 56. Stemmed search was not counted: that index predates the stem table.
+
 ## Reuse and licence
 
-Quotation normalisation and regression cases adapt `fadden/as_at.py`; page completeness adapts the invariant in `fadden/extract.py`; staging follows the tax corpus's complete-output-before-promotion pattern. Upstream is au-tax-legislation-corpus at `84db0481a924f07d3f697f54a269917475613184`. Its tax date model, Register EPUB parser, attribution assumptions and publication filters are not used for AASB documents.
+Quotation normalisation and regression cases adapt `fadden/as_at.py`; page completeness adapts the invariant in `fadden/extract.py`; staging follows the tax corpus's complete-output-before-promotion pattern. Upstream is [PaulGoodman](https://github.com/ryanduguid/PaulGoodman), formerly au-tax-legislation-corpus, at `84db0481a924f07d3f697f54a269917475613184`. Its tax date model, Register EPUB parser, attribution assumptions and publication filters are not used for AASB documents.
 
 Code is Apache-2.0; retain LICENSE and NOTICE. Source documents keep their own copyright notices and rights. This local build does not publish the corpus.
