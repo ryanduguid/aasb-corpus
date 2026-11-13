@@ -201,14 +201,7 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
         return Err("extraction failures or changed source manifest".into());
     }
     let catalogue: Value = read_json(&root.join("catalogue.json"))?;
-    let mut grouped: BTreeMap<&str, Vec<&Source>> = BTreeMap::new();
-    for source in &sources.files {
-        valid_sha(&source.sha256)?;
-        if file_hash(&root.join("source").join(filename(&source.filename)?))? != source.sha256 {
-            return Err(format!("source changed: {}", source.filename).into());
-        }
-        grouped.entry(&source.sha256).or_default().push(source);
-    }
+    let mut grouped = group_sources(root, &sources)?;
     if extraction.documents.len() != grouped.len() {
         return Err("extraction document coverage differs".into());
     }
@@ -222,57 +215,7 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
         let aliases = grouped
             .remove(document.sha256.as_str())
             .ok_or("missing or duplicate document identity")?;
-        if aliases
-            .iter()
-            .any(|source| source.page_count != document.page_count)
-        {
-            return Err("source and extraction page counts differ".into());
-        }
-        let page_path = root
-            .join("extracted")
-            .join(&document.sha256)
-            .join("pages.jsonl");
-        if file_hash(&page_path)? != document.pages_sha256 {
-            return Err("extracted pages changed".into());
-        }
-        let alias_json: Vec<Value> = aliases
-            .iter()
-            .map(|source| json!({"filename":source.filename,"source_url":source.source_url}))
-            .collect();
-        transaction.execute(
-            "INSERT INTO documents VALUES (?1,?2,?3,?4,?5)",
-            params![
-                document.sha256,
-                document.page_count,
-                serde_json::to_string(&alias_json)?,
-                serde_json::to_string(&metadata_for(&catalogue, &aliases))?,
-                document.pages_sha256
-            ],
-        )?;
-        let mut expected = 1;
-        for line in BufReader::new(File::open(&page_path)?).lines() {
-            let page: Page = serde_json::from_str(&line?)?;
-            if page.page != expected {
-                return Err("missing, duplicated or reordered page".into());
-            }
-            transaction.execute(
-                "INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review)
-                VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    document.sha256,
-                    page.page,
-                    page.text,
-                    hash(page.text.as_bytes()),
-                    page.provenance,
-                    page.needs_review || page.text.trim().is_empty()
-                ],
-            )?;
-            expected += 1;
-            page_count += 1;
-        }
-        if expected != document.page_count + 1 || file_hash(&page_path)? != document.pages_sha256 {
-            return Err("page coverage differs or extraction changed during indexing".into());
-        }
+        page_count += index_document(&transaction, root, &catalogue, document, &aliases)?;
     }
     for table in ["pages_fts", "pages_stem"] {
         transaction.execute(
@@ -294,6 +237,86 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
     Ok(
         json!({"documents":extraction.documents.len(),"source_files":sources.files.len(),"pages":page_count,"index":target}),
     )
+}
+
+fn group_sources<'a>(
+    root: &Path,
+    sources: &'a Sources,
+) -> Result<BTreeMap<&'a str, Vec<&'a Source>>> {
+    let mut grouped: BTreeMap<&str, Vec<&Source>> = BTreeMap::new();
+    for source in &sources.files {
+        valid_sha(&source.sha256)?;
+        if file_hash(&root.join("source").join(filename(&source.filename)?))? != source.sha256 {
+            return Err(format!("source changed: {}", source.filename).into());
+        }
+        grouped.entry(&source.sha256).or_default().push(source);
+    }
+    Ok(grouped)
+}
+
+fn insert_pages(connection: &Connection, document: &Document, page_path: &Path) -> Result<()> {
+    let mut expected = 1;
+    for line in BufReader::new(File::open(page_path)?).lines() {
+        let page: Page = serde_json::from_str(&line?)?;
+        if page.page != expected {
+            return Err("missing, duplicated or reordered page".into());
+        }
+        connection.execute(
+            "INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review)
+            VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                document.sha256,
+                page.page,
+                page.text,
+                hash(page.text.as_bytes()),
+                page.provenance,
+                page.needs_review || page.text.trim().is_empty()
+            ],
+        )?;
+        expected += 1;
+    }
+    if expected != document.page_count + 1 || file_hash(page_path)? != document.pages_sha256 {
+        return Err("page coverage differs or extraction changed during indexing".into());
+    }
+    Ok(())
+}
+
+fn index_document(
+    connection: &Connection,
+    root: &Path,
+    catalogue: &Value,
+    document: &Document,
+    aliases: &[&Source],
+) -> Result<u64> {
+    if aliases
+        .iter()
+        .any(|source| source.page_count != document.page_count)
+    {
+        return Err("source and extraction page counts differ".into());
+    }
+    let page_path = root
+        .join("extracted")
+        .join(&document.sha256)
+        .join("pages.jsonl");
+    if file_hash(&page_path)? != document.pages_sha256 {
+        return Err("extracted pages changed".into());
+    }
+    let alias_json: Vec<Value> = aliases
+        .iter()
+        .map(|source| json!({"filename":source.filename,"source_url":source.source_url}))
+        .collect();
+    connection.execute(
+        "INSERT INTO documents VALUES (?1,?2,?3,?4,?5)",
+        params![
+            document.sha256,
+            document.page_count,
+            serde_json::to_string(&alias_json)?,
+            serde_json::to_string(&metadata_for(catalogue, aliases))?,
+            document.pages_sha256
+        ],
+    )?;
+    insert_pages(connection, document, &page_path)?;
+    Ok(u64::from(document.page_count))
 }
 
 fn schema_version(connection: &Connection) -> Result<i64> {
@@ -473,6 +496,29 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     } else {
         None
     };
+    let mut hits = search_hits(connection, table, query, selected.as_deref(), options)?;
+    let has_more = hits.len() > options.limit as usize;
+    hits.truncate(options.limit as usize);
+    let mut result = json!({"query":query,"results":hits,"limit":options.limit,"offset":options.offset,
+        "filters":options.filters(),"has_more":has_more,
+        "next_offset":has_more.then_some(options.offset + i64::from(options.limit)),
+        "boundary":"Search covers captured versions; it does not determine reporting-period applicability."});
+    if stem {
+        result["stemmed"] = json!(true);
+        result["stem_boundary"] = json!(
+            "Stemmed hits match word forms, not the query's words. Check any quotation with verify-quote."
+        );
+    }
+    Ok(result)
+}
+
+fn search_hits(
+    connection: &Connection,
+    table: &str,
+    query: &str,
+    selected: Option<&str>,
+    options: &QueryOptions,
+) -> Result<Vec<Value>> {
     let mut statement = connection.prepare(&format!(
         "SELECT p.document_sha256,p.page,
         snippet({table},0,'[',']',' … ',40),p.provenance,p.needs_review,d.aliases,d.metadata
@@ -503,19 +549,7 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
             "provenance":provenance,"needs_review":needs_review,
             "sources":serde_json::from_str::<Value>(&aliases)?,"version_metadata":serde_json::from_str::<Value>(&metadata)?}));
     }
-    let has_more = hits.len() > options.limit as usize;
-    hits.truncate(options.limit as usize);
-    let mut result = json!({"query":query,"results":hits,"limit":options.limit,"offset":options.offset,
-        "filters":options.filters(),"has_more":has_more,
-        "next_offset":has_more.then_some(options.offset + i64::from(options.limit)),
-        "boundary":"Search covers captured versions; it does not determine reporting-period applicability."});
-    if stem {
-        result["stemmed"] = json!(true);
-        result["stem_boundary"] = json!(
-            "Stemmed hits match word forms, not the query's words. Check any quotation with verify-quote."
-        );
-    }
-    Ok(result)
+    Ok(hits)
 }
 
 #[derive(Deserialize)]
@@ -537,19 +571,7 @@ struct Reading {
     text: String,
 }
 
-/// Loads one PDF's independent page texts from `tools/second_reader.py`. `None` means the
-/// snapshot has no `second-reader` folder or pypdf's failure on this PDF is recorded; a
-/// changed, stale, incomplete or unknown reading is an error.
-fn second_reading(
-    root: &Path,
-    sha: &str,
-    page_count: usize,
-) -> Result<Option<(String, Vec<String>)>> {
-    let folder = root.join("second-reader");
-    if !folder.exists() {
-        return Ok(None);
-    }
-    let manifest: SecondReader = read_json(&folder.join("manifest.json"))?;
+fn check_second_reader(root: &Path, manifest: &SecondReader) -> Result<()> {
     if manifest.schema_version != 1
         || manifest.reader != "pypdf"
         || manifest.reader_version.trim().is_empty()
@@ -569,6 +591,23 @@ fn second_reading(
     if !recorded.chain(failed).all(|digest| covered.insert(digest)) || covered != expected {
         return Err("second reading does not cover each source document exactly once".into());
     }
+    Ok(())
+}
+
+/// Loads one PDF's independent page texts from `tools/second_reader.py`. `None` means the
+/// snapshot has no `second-reader` folder or pypdf's failure on this PDF is recorded; a
+/// changed, stale, incomplete or unknown reading is an error.
+fn second_reading(
+    root: &Path,
+    sha: &str,
+    page_count: usize,
+) -> Result<Option<(String, Vec<String>)>> {
+    let folder = root.join("second-reader");
+    if !folder.exists() {
+        return Ok(None);
+    }
+    let manifest: SecondReader = read_json(&folder.join("manifest.json"))?;
+    check_second_reader(root, &manifest)?;
     if manifest.failures.iter().any(|f| f.sha256 == sha) {
         return Ok(None);
     }
@@ -685,21 +724,12 @@ fn source_problems(root: &Path, sha: &str, aliases: &Value) -> Result<Vec<String
     Ok(problems)
 }
 
-/// Only an exact match on a named native page, with every source PDF file unchanged, is
-/// verified; `unverified_reasons` lists every condition that is not met.
-fn verify_quote(
-    root: &Path,
+fn graded_pages(
     connection: &Connection,
     sha: &str,
     number: Option<u32>,
     quote: &str,
-) -> Result<Value> {
-    valid_sha(sha)?;
-    let (aliases, metadata): (String, String) = connection.query_row(
-        "SELECT aliases,metadata FROM documents WHERE sha256=?1",
-        [sha],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+) -> Result<Vec<Value>> {
     let mut statement = connection.prepare(
         "SELECT page,text,text_sha256,provenance,needs_review FROM pages
         WHERE document_sha256=?1 AND (?2 IS NULL OR page=?2) ORDER BY page",
@@ -728,6 +758,25 @@ fn verify_quote(
     if pages.is_empty() {
         return Err("page is not present in this document".into());
     }
+    Ok(pages)
+}
+
+/// Only an exact match on a named native page, with every source PDF file unchanged, is
+/// verified; `unverified_reasons` lists every condition that is not met.
+fn verify_quote(
+    root: &Path,
+    connection: &Connection,
+    sha: &str,
+    number: Option<u32>,
+    quote: &str,
+) -> Result<Value> {
+    valid_sha(sha)?;
+    let (aliases, metadata): (String, String) = connection.query_row(
+        "SELECT aliases,metadata FROM documents WHERE sha256=?1",
+        [sha],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut pages = graded_pages(connection, sha, number, quote)?;
     let best = pages.iter().map(grade_rank).max().unwrap_or_default();
     let mut result = if number.is_some() {
         pages.swap_remove(0)

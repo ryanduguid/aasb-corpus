@@ -132,10 +132,7 @@ struct Line<'a> {
     skip: bool,
 }
 
-pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
-    if label.len() > 32 || !label.is_ascii() || !valid_label(label) {
-        return Err("use an exact paragraph label such as 35, B19, Aus25.1 or BC1; request the parent paragraph for lettered subparagraphs".into());
-    }
+fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
     let mut lines = Vec::new();
     for page in pages {
         let contents = page.text.lines().any(|line| {
@@ -151,6 +148,117 @@ pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
             });
         }
     }
+    lines
+}
+
+fn candidate(lines: &[Line<'_>], label: &str, start: usize, next: Option<&(usize, &str)>) -> Value {
+    let mut end = next.map_or(lines.len(), |(index, _)| *index);
+    let mut reasons = Vec::new();
+    if !next.is_some_and(|(_, next_label)| follows(label, next_label)) {
+        reasons.push("No adjacent numbered paragraph confirms the ending.");
+    }
+    if let Some(index) = (start + 1..end).find(|i| !lines[*i].skip && heading(lines[*i].text)) {
+        if lines[index + 1..end]
+            .iter()
+            .any(|line| !line.skip && !line.text.trim().is_empty() && !heading(line.text))
+        {
+            reasons.push("A section heading interrupts text before the next paragraph anchor.");
+        }
+        end = index;
+    }
+    let selected = &lines[start..end];
+    reasons.extend(span_reasons(selected));
+    let mut fragments = fragments(selected);
+    let mut footnotes: Vec<_> = selected
+        .iter()
+        .filter(|line| reference_footnote(line.text))
+        .map(|line| {
+            json!({"pdf_page":line.page.page,"line":line.number,"text":line.text,
+            "provenance":line.page.provenance,"needs_review":line.page.needs_review})
+        })
+        .collect();
+    let bytes: usize = fragments
+        .iter()
+        .chain(&footnotes)
+        .map(|f| f["text"].as_str().map_or(0, str::len))
+        .sum();
+    if bytes > 65_536 {
+        reasons.push("The candidate exceeds 64 KiB; read the cited pages for its text.");
+        for fragment in fragments.iter_mut().chain(&mut footnotes) {
+            fragment["text"] = Value::Null;
+        }
+    }
+    json!({"needs_review":!reasons.is_empty(),"review_reasons":reasons,
+    "next_paragraph":next.map(|(_, label)| *label),"fragments":fragments,"reference_footnotes":footnotes})
+}
+
+fn span_reasons(selected: &[Line<'_>]) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if selected.windows(2).any(|pair| {
+        pair[0].page.page != pair[1].page.page
+            && pair[0].page.page.checked_add(1) != Some(pair[1].page.page)
+    }) {
+        reasons.push("A physical page is missing within the candidate span.");
+    }
+    if selected
+        .iter()
+        .any(|line| !line.skip && (line.page.needs_review || line.page.provenance != "native"))
+    {
+        reasons.push("The source span includes OCR or a page flagged for review.");
+    }
+    if selected.iter().any(|line| {
+        !line.skip && (line.text.trim_start().starts_with('|') || line.text.contains("<table"))
+    }) {
+        reasons.push("The candidate includes a table whose layout requires source review.");
+    }
+    reasons
+}
+
+fn fragments(selected: &[Line<'_>]) -> Vec<Value> {
+    let mut fragments = Vec::new();
+    let mut chunk = Vec::<&Line<'_>>::new();
+    let flush = |chunk: &mut Vec<&Line<'_>>, fragments: &mut Vec<Value>| {
+        while chunk.last().is_some_and(|line| line.text.trim().is_empty()) {
+            chunk.pop();
+        }
+        if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
+            let text = chunk
+                .iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            fragments.push(
+                json!({"pdf_page":first.page.page,"start_line":first.number,"end_line":last.number,
+                "text":text,"page_text_sha256":hash(first.page.text.as_bytes()),
+                "provenance":first.page.provenance,"needs_review":first.page.needs_review}),
+            );
+        }
+        chunk.clear();
+    };
+    for line in selected {
+        if line.skip {
+            flush(&mut chunk, &mut fragments);
+            continue;
+        }
+        if chunk
+            .last()
+            .is_some_and(|previous| previous.page.page != line.page.page)
+        {
+            flush(&mut chunk, &mut fragments);
+        }
+        if !chunk.is_empty() || !line.text.trim().is_empty() {
+            chunk.push(line);
+        }
+    }
+    flush(&mut chunk, &mut fragments);
+    fragments
+}
+
+pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
+    if label.len() > 32 || !label.is_ascii() || !valid_label(label) {
+        return Err("use an exact paragraph label such as 35, B19, Aus25.1 or BC1; request the parent paragraph for lettered subparagraphs".into());
+    }
+    let lines = page_lines(pages);
     let anchors: Vec<_> = lines
         .iter()
         .enumerate()
@@ -164,97 +272,7 @@ pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
         .collect();
     let mut candidates = Vec::new();
     for (position, (start, _)) in starts.iter().take(20) {
-        let next = anchors.get(position + 1);
-        let mut end = next.map_or(lines.len(), |(index, _)| *index);
-        let mut reasons = Vec::new();
-        if !next.is_some_and(|(_, next_label)| follows(label, next_label)) {
-            reasons.push("No adjacent numbered paragraph confirms the ending.");
-        }
-        if let Some(index) = (*start + 1..end).find(|i| !lines[*i].skip && heading(lines[*i].text))
-        {
-            if lines[index + 1..end]
-                .iter()
-                .any(|line| !line.skip && !line.text.trim().is_empty() && !heading(line.text))
-            {
-                reasons.push("A section heading interrupts text before the next paragraph anchor.");
-            }
-            end = index;
-        }
-        let selected = &lines[*start..end];
-        if selected.windows(2).any(|pair| {
-            pair[0].page.page != pair[1].page.page
-                && pair[0].page.page.checked_add(1) != Some(pair[1].page.page)
-        }) {
-            reasons.push("A physical page is missing within the candidate span.");
-        }
-        if selected
-            .iter()
-            .any(|line| !line.skip && (line.page.needs_review || line.page.provenance != "native"))
-        {
-            reasons.push("The source span includes OCR or a page flagged for review.");
-        }
-        if selected.iter().any(|line| {
-            !line.skip && (line.text.trim_start().starts_with('|') || line.text.contains("<table"))
-        }) {
-            reasons.push("The candidate includes a table whose layout requires source review.");
-        }
-        let mut fragments = Vec::new();
-        let mut chunk = Vec::<&Line<'_>>::new();
-        let flush = |chunk: &mut Vec<&Line<'_>>, fragments: &mut Vec<Value>| {
-            while chunk.last().is_some_and(|line| line.text.trim().is_empty()) {
-                chunk.pop();
-            }
-            if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
-                let text = chunk
-                    .iter()
-                    .map(|line| line.text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                fragments.push(json!({"pdf_page":first.page.page,"start_line":first.number,"end_line":last.number,
-                    "text":text,"page_text_sha256":hash(first.page.text.as_bytes()),
-                    "provenance":first.page.provenance,"needs_review":first.page.needs_review}));
-            }
-            chunk.clear();
-        };
-        for line in selected {
-            if line.skip {
-                flush(&mut chunk, &mut fragments);
-                continue;
-            }
-            if chunk
-                .last()
-                .is_some_and(|previous| previous.page.page != line.page.page)
-            {
-                flush(&mut chunk, &mut fragments);
-            }
-            if !chunk.is_empty() || !line.text.trim().is_empty() {
-                chunk.push(line);
-            }
-        }
-        flush(&mut chunk, &mut fragments);
-        let mut footnotes: Vec<_> = selected
-            .iter()
-            .filter(|line| reference_footnote(line.text))
-            .map(|line| {
-                json!({"pdf_page":line.page.page,"line":line.number,"text":line.text,
-                "provenance":line.page.provenance,"needs_review":line.page.needs_review})
-            })
-            .collect();
-        let bytes: usize = fragments
-            .iter()
-            .chain(&footnotes)
-            .map(|f| f["text"].as_str().map_or(0, str::len))
-            .sum();
-        if bytes > 65_536 {
-            reasons.push("The candidate exceeds 64 KiB; read the cited pages for its text.");
-            for fragment in fragments.iter_mut().chain(&mut footnotes) {
-                fragment["text"] = Value::Null;
-            }
-        }
-        candidates.push(
-            json!({"needs_review":!reasons.is_empty(),"review_reasons":reasons,
-            "next_paragraph":next.map(|(_, label)| *label),"fragments":fragments,"reference_footnotes":footnotes}),
-        );
+        candidates.push(candidate(&lines, label, *start, anchors.get(position + 1)));
     }
     let status = match starts.len() {
         0 => "not_found",
@@ -301,15 +319,7 @@ fn contiguous(fragment: &str, reading: &str) -> bool {
     !fragment.is_empty() && (0..reading.len()).any(matches_at)
 }
 
-/// Confirms a `found` paragraph against an independent reading of the same PDF pages.
-/// Without that reading the status becomes `found_unconfirmed`; a mismatch or a fragment
-/// without words needs review.
-/// A found result without fragments, fragment text or physical pages is an error.
-pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)>) -> Result<()> {
-    if result["status"] != "found" {
-        result["second_reader"] = json!({"status":"not_checked"});
-        return Ok(());
-    }
+fn found_fragments(result: &Value) -> Result<Vec<(String, u64)>> {
     let mut fragments = Vec::new();
     for fragment in result["candidates"][0]["fragments"]
         .as_array()
@@ -324,15 +334,33 @@ pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)
     if fragments.is_empty() {
         return Err("found paragraph has no fragments".into());
     }
+    Ok(fragments)
+}
+
+fn flag_for_review(result: &mut Value, reason: &str) {
+    let candidate = &mut result["candidates"][0];
+    candidate["needs_review"] = json!(true);
+    if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
+        reasons.push(json!(reason));
+    }
+    result["status"] = json!("needs_review");
+}
+
+/// Confirms a `found` paragraph against an independent reading of the same PDF pages.
+/// Without that reading the status becomes `found_unconfirmed`; a mismatch or a fragment
+/// without words needs review.
+/// A found result without fragments, fragment text or physical pages is an error.
+pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)>) -> Result<()> {
+    if result["status"] != "found" {
+        result["second_reader"] = json!({"status":"not_checked"});
+        return Ok(());
+    }
+    let fragments = found_fragments(result)?;
     if fragments.iter().any(|(text, _)| tokens(text).is_empty()) {
-        let candidate = &mut result["candidates"][0];
-        candidate["needs_review"] = json!(true);
-        if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
-            reasons.push(json!(
-                "A fragment has no words for a second reader to confirm."
-            ));
-        }
-        result["status"] = json!("needs_review");
+        flag_for_review(
+            result,
+            "A fragment has no words for a second reader to confirm.",
+        );
         result["second_reader"] = json!({"status":"not_checked"});
         return Ok(());
     }
@@ -356,14 +384,10 @@ pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)
         result["second_reader"] = json!({"status":"confirmed","reader":reader});
         return Ok(());
     }
-    let candidate = &mut result["candidates"][0];
-    candidate["needs_review"] = json!(true);
-    if let Some(reasons) = candidate["review_reasons"].as_array_mut() {
-        reasons.push(json!(
-            "A second reader did not confirm the fragment's words in order on its page."
-        ));
-    }
-    result["status"] = json!("needs_review");
+    flag_for_review(
+        result,
+        "A second reader did not confirm the fragment's words in order on its page.",
+    );
     result["second_reader"] =
         json!({"status":"mismatch","reader":reader,"unconfirmed_pages":unconfirmed});
     Ok(())

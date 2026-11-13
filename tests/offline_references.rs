@@ -148,6 +148,34 @@ fn identities(result: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+/// One fabricated document's catalogue row, page and unconfirmed paragraph 26.
+fn check_document(fixture: &Fixture, name: &str, standard: &str, label: &str, text: &str) {
+    let sha = hash(&source(name));
+    let catalogue = fixture.call("catalogue", &["--standard", standard, "--version", &sha]);
+    assert_eq!(catalogue["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        catalogue["results"][0]["version_metadata"][0]["version_label"],
+        label
+    );
+    let page = fixture.call("page", &[&sha, "1"]);
+    assert_eq!(page["text"], text);
+    assert_eq!(page["document_sha256"], sha);
+    assert_eq!(page["pdf_page"], 1);
+    let paragraph = fixture.call("paragraph", &[&sha, "26"]);
+    assert_eq!(paragraph["status"], "found_unconfirmed");
+    assert_eq!(paragraph["second_reader"]["status"], "unavailable");
+    assert_eq!(paragraph["candidate_count"], 1);
+    let candidate = &paragraph["candidates"][0];
+    assert_eq!(candidate["next_paragraph"], "27");
+    assert_eq!(candidate["fragments"].as_array().unwrap().len(), 1);
+    let fragment = &candidate["fragments"][0];
+    assert_eq!(fragment["text"], text.lines().next().unwrap());
+    assert_eq!(fragment["pdf_page"], 1);
+    assert_eq!(fragment["start_line"], 1);
+    assert_eq!(fragment["end_line"], 1);
+    assert_eq!(fragment["page_text_sha256"], hash(text.as_bytes()));
+}
+
 #[test]
 fn fabricated_versions_and_near_identifiers_have_exact_references() {
     let fixture = Fixture::new();
@@ -190,30 +218,7 @@ fn fabricated_versions_and_near_identifiers_have_exact_references() {
         }
     }
     for (name, standard, label, text) in DOCUMENTS {
-        let sha = hash(&source(name));
-        let catalogue = fixture.call("catalogue", &["--standard", standard, "--version", &sha]);
-        assert_eq!(catalogue["results"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            catalogue["results"][0]["version_metadata"][0]["version_label"],
-            label
-        );
-        let page = fixture.call("page", &[&sha, "1"]);
-        assert_eq!(page["text"], text);
-        assert_eq!(page["document_sha256"], sha);
-        assert_eq!(page["pdf_page"], 1);
-        let paragraph = fixture.call("paragraph", &[&sha, "26"]);
-        assert_eq!(paragraph["status"], "found_unconfirmed");
-        assert_eq!(paragraph["second_reader"]["status"], "unavailable");
-        assert_eq!(paragraph["candidate_count"], 1);
-        let candidate = &paragraph["candidates"][0];
-        assert_eq!(candidate["next_paragraph"], "27");
-        assert_eq!(candidate["fragments"].as_array().unwrap().len(), 1);
-        let fragment = &candidate["fragments"][0];
-        assert_eq!(fragment["text"], text.lines().next().unwrap());
-        assert_eq!(fragment["pdf_page"], 1);
-        assert_eq!(fragment["start_line"], 1);
-        assert_eq!(fragment["end_line"], 1);
-        assert_eq!(fragment["page_text_sha256"], hash(text.as_bytes()));
+        check_document(&fixture, name, standard, label, text);
     }
     fixture.add_fabricated_reader_metadata();
     for (name, _, _, _) in DOCUMENTS {
@@ -404,6 +409,11 @@ fn mcp_lines(requests: &[Value]) -> String {
 
 /// Run `mcp ROOT` on `requests` until stdin closes; return its replies and stderr.
 fn mcp(root: &Path, requests: &[Value]) -> (Vec<Value>, String) {
+    mcp_input(root, &mcp_lines(requests))
+}
+
+/// Run `mcp ROOT` on raw `input` lines until stdin closes; return its replies and stderr.
+fn mcp_input(root: &Path, input: &str) -> (Vec<Value>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
         .arg("mcp")
         .arg(root)
@@ -416,7 +426,7 @@ fn mcp(root: &Path, requests: &[Value]) -> (Vec<Value>, String) {
         .stdin
         .take()
         .unwrap()
-        .write_all(mcp_lines(requests).as_bytes())
+        .write_all(input.as_bytes())
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
@@ -426,6 +436,15 @@ fn mcp(root: &Path, requests: &[Value]) -> (Vec<Value>, String) {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     (replies, String::from_utf8(output.stderr).unwrap())
+}
+
+fn tool_names(reply: &Value) -> Vec<&str> {
+    reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect()
 }
 
 #[test]
@@ -443,24 +462,12 @@ fn mcp_tools_answer_as_the_commands_do() {
     requests.extend(tool_calls(&sha));
     let (replies, stderr) = mcp(&fixture.0, &requests);
     assert_eq!(stderr, "");
-    let ids: Vec<&Value> = replies.iter().map(|r| &r["id"]).collect();
-    assert_eq!(
-        ids,
-        [1, 2, 3, 4, 5, 6]
-            .map(|n| json!(n))
-            .iter()
-            .collect::<Vec<_>>()
-    );
+    let ids: Vec<Value> = replies.iter().map(|r| r["id"].clone()).collect();
+    assert_eq!(ids, (1..=6).map(|n| json!(n)).collect::<Vec<_>>());
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(replies[0]["result"]["capabilities"], json!({"tools":{}}));
-    let names: Vec<&str> = replies[1]["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
     assert_eq!(
-        names,
+        tool_names(&replies[1]),
         [
             "search_aasb_pages",
             "list_aasb_documents",
@@ -490,6 +497,10 @@ fn mcp_tools_answer_as_the_commands_do() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "each request is checked by its reply's index; splitting the table from its checks hides the pairing"
+)]
 fn mcp_refuses_paths_unknown_tools_and_malformed_requests() {
     let fixture = Fixture::new();
     fixture.call("build", &[]);
@@ -529,28 +540,8 @@ fn mcp_refuses_paths_unknown_tools_and_malformed_requests() {
     ];
     let mut input = mcp_lines(&requests);
     input.push_str("not json\n");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
-        .arg("mcp")
-        .arg(&fixture.0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    let replies: Vec<Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let (replies, stderr) = mcp_input(&fixture.0, &input);
+    assert_eq!(stderr, "");
     let tool_error = |n: usize| {
         assert_eq!(replies[n]["result"]["isError"], true, "{}", replies[n]);
         replies[n]["result"]["content"][0]["text"]

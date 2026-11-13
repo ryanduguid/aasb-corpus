@@ -17,15 +17,13 @@ fn call(root: &str, command: &str, arguments: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-#[test]
-#[ignore = "requires AASB_TEST_SNAPSHOT pointing to a local captured index"]
-fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
-    let root = std::env::var("AASB_TEST_SNAPSHOT").expect("set AASB_TEST_SNAPSHOT");
+/// Every (document, page) a paginated AASB 15 search returns, each exactly once.
+fn paginated_aasb15_pages(root: &str) -> BTreeSet<(String, u64)> {
     let mut all = BTreeSet::new();
     let mut offset = 0;
     loop {
         let found = call(
-            &root,
+            root,
             "search",
             &[
                 "\"performance obligation\"",
@@ -58,6 +56,84 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
             break;
         }
     }
+    all
+}
+
+/// A fragment is an unchanged slice of its page; a found one verifies as a quotation.
+fn check_fragment(root: &str, sha: &str, fragment: &Value, found: bool) {
+    let page = call(root, "page", &[sha, &fragment["pdf_page"].to_string()]);
+    let text = page["text"].as_str().unwrap();
+    let start = fragment["start_line"].as_u64().unwrap() as usize - 1;
+    let end = fragment["end_line"].as_u64().unwrap() as usize;
+    assert_eq!(
+        fragment["text"],
+        text.lines()
+            .skip(start)
+            .take(end - start)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if found {
+        let line = fragment["text"].as_str().unwrap().lines().next().unwrap();
+        let pdf_page = fragment["pdf_page"].to_string();
+        let checked = call(root, "verify-quote", &[sha, &pdf_page, line]);
+        assert_eq!(checked["verified"], true);
+        assert_eq!(checked["page_text_sha256"], fragment["page_text_sha256"]);
+    }
+}
+
+/// Filtered search, paragraph lookup and fragment checks for one version; returns its status.
+fn check_paragraph_version(
+    root: &str,
+    standard: &str,
+    label: &str,
+    document: &Value,
+    spans: &mut usize,
+) -> String {
+    let sha = document["document_sha256"].as_str().unwrap();
+    let filtered = call(
+        root,
+        "search",
+        &[
+            "the",
+            "--standard",
+            standard,
+            "--version",
+            sha,
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(filtered["results"][0]["document_sha256"], sha);
+    let found = call(root, "paragraph", &[sha, label]);
+    println!(
+        "{standard} {label} {}: status={} next={} reasons={}",
+        &sha[..8],
+        found["status"],
+        found["candidates"][0]["next_paragraph"],
+        found["candidates"][0]["review_reasons"]
+    );
+    assert!(
+        found["candidate_count"].as_u64().unwrap() > 0,
+        "missing {standard} {label} in {sha}"
+    );
+    assert_eq!(found["document_sha256"], sha);
+    assert_eq!(found["sources"], document["sources"]);
+    assert_eq!(found["version_metadata"], document["version_metadata"]);
+    for candidate in found["candidates"].as_array().unwrap() {
+        for fragment in candidate["fragments"].as_array().unwrap() {
+            check_fragment(root, sha, fragment, found["status"] == "found");
+            *spans += 1;
+        }
+    }
+    found["status"].as_str().unwrap().to_owned()
+}
+
+#[test]
+#[ignore = "requires AASB_TEST_SNAPSHOT pointing to a local captured index"]
+fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
+    let root = std::env::var("AASB_TEST_SNAPSHOT").expect("set AASB_TEST_SNAPSHOT");
+    let all = paginated_aasb15_pages(&root);
     assert!(!all.is_empty());
     let mut paragraphs = 0;
     let mut spans = 0;
@@ -71,63 +147,8 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
         let documents = catalogue["results"].as_array().unwrap();
         assert!(!documents.is_empty());
         for document in documents {
-            let sha = document["document_sha256"].as_str().unwrap();
-            let filtered = call(
-                &root,
-                "search",
-                &[
-                    "the",
-                    "--standard",
-                    standard,
-                    "--version",
-                    sha,
-                    "--limit",
-                    "1",
-                ],
-            );
-            assert_eq!(filtered["results"][0]["document_sha256"], sha);
-            let found = call(&root, "paragraph", &[sha, label]);
-            println!(
-                "{standard} {label} {}: status={} next={} reasons={}",
-                &sha[..8],
-                found["status"],
-                found["candidates"][0]["next_paragraph"],
-                found["candidates"][0]["review_reasons"]
-            );
-            assert!(
-                found["candidate_count"].as_u64().unwrap() > 0,
-                "missing {standard} {label} in {sha}"
-            );
-            *statuses
-                .entry(found["status"].as_str().unwrap().to_owned())
-                .or_default() += 1;
-            assert_eq!(found["document_sha256"], sha);
-            assert_eq!(found["sources"], document["sources"]);
-            assert_eq!(found["version_metadata"], document["version_metadata"]);
-            for candidate in found["candidates"].as_array().unwrap() {
-                for fragment in candidate["fragments"].as_array().unwrap() {
-                    let page = call(&root, "page", &[sha, &fragment["pdf_page"].to_string()]);
-                    let text = page["text"].as_str().unwrap();
-                    let start = fragment["start_line"].as_u64().unwrap() as usize - 1;
-                    let end = fragment["end_line"].as_u64().unwrap() as usize;
-                    assert_eq!(
-                        fragment["text"],
-                        text.lines()
-                            .skip(start)
-                            .take(end - start)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                    if found["status"] == "found" {
-                        let line = fragment["text"].as_str().unwrap().lines().next().unwrap();
-                        let pdf_page = fragment["pdf_page"].to_string();
-                        let checked = call(&root, "verify-quote", &[sha, &pdf_page, line]);
-                        assert_eq!(checked["verified"], true);
-                        assert_eq!(checked["page_text_sha256"], fragment["page_text_sha256"]);
-                    }
-                    spans += 1;
-                }
-            }
+            let status = check_paragraph_version(&root, standard, label, document, &mut spans);
+            *statuses.entry(status).or_default() += 1;
             paragraphs += 1;
         }
     }
@@ -139,6 +160,33 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
         "local snapshot: {} distinct paginated AASB 15 pages; {paragraphs} paragraph lookups; {spans} exact page spans; statuses={statuses:?}",
         all.len()
     );
+}
+
+/// Exact search always; stemmed search too when the index has the stem table.
+fn stem_modes(root: &str) -> &'static [bool] {
+    let index = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(root).join("index.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let version: i64 = index
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    if version >= 2 {
+        &[false, true]
+    } else {
+        &[false]
+    }
+}
+
+fn fragment_pages(found: &Value) -> BTreeSet<u64> {
+    found["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|candidate| candidate["fragments"].as_array().unwrap())
+        .map(|fragment| fragment["pdf_page"].as_u64().unwrap())
+        .collect()
 }
 
 /// Whether a search's first `limit` results include one of `pages` of document `sha`.
@@ -162,19 +210,7 @@ fn ranked(root: &str, query: &str, sha: &str, pages: &BTreeSet<u64>, stem: bool)
 #[ignore = "requires AASB_TEST_SNAPSHOT pointing to a local captured index"]
 fn reference_questions_on_the_local_snapshot() {
     let root = std::env::var("AASB_TEST_SNAPSHOT").expect("set AASB_TEST_SNAPSHOT");
-    let index = rusqlite::Connection::open_with_flags(
-        std::path::Path::new(&root).join("index.sqlite3"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let version: i64 = index
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    let modes: &[bool] = if version >= 2 {
-        &[false, true]
-    } else {
-        &[false]
-    };
+    let modes = stem_modes(&root);
     let questions = include_str!("fixtures/reference-questions.tsv");
     let mut statuses = std::collections::BTreeMap::<String, usize>::new();
     let mut located = 0;
@@ -194,13 +230,7 @@ fn reference_questions_on_the_local_snapshot() {
             let sha = document["document_sha256"].as_str().unwrap();
             let found = call(&root, "paragraph", &[sha, label]);
             let status = found["status"].as_str().unwrap().to_owned();
-            let pages: BTreeSet<u64> = found["candidates"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|candidate| candidate["fragments"].as_array().unwrap())
-                .map(|fragment| fragment["pdf_page"].as_u64().unwrap())
-                .collect();
+            let pages = fragment_pages(&found);
             *statuses.entry(status).or_default() += 1;
             if pages.is_empty() {
                 continue;

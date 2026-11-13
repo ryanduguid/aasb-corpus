@@ -2,17 +2,11 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[test]
-#[ignore = "requires hash-pinned, built snapshot with both actual readers in AASB_PUBLIC_SNAPSHOT"]
-fn official_paragraphs_have_independent_page_and_reader_confirmation() {
-    let reference: Value =
-        serde_json::from_str(include_str!("fixtures/public-references.json")).unwrap();
-    let root =
-        PathBuf::from(std::env::var_os("AASB_PUBLIC_SNAPSHOT").expect("set AASB_PUBLIC_SNAPSHOT"));
-    let sha = reference["sha256"].as_str().unwrap();
+/// The pinned source is in the manifest under a bare filename, and its bytes have the pinned hash.
+fn check_pinned_source(root: &Path, reference: &Value, sha: &str) {
     let sources: Value =
         serde_json::from_slice(&fs::read(root.join("source/manifest.json")).unwrap()).unwrap();
     let source = sources["files"]
@@ -35,6 +29,49 @@ fn official_paragraphs_have_independent_page_and_reader_confirmation() {
         .map(|b| format!("{b:02x}"))
         .collect();
     assert_eq!(digest, sha);
+}
+
+/// A confirmed, single-candidate lookup on the expected page, with conditions where expected.
+fn check_paragraph(expected: &Value, found: &Value) {
+    assert_eq!(
+        found["status"], "found",
+        "paragraph {}: {found}",
+        expected["number"]
+    );
+    assert_eq!(found["second_reader"]["status"], "confirmed");
+    assert_eq!(found["candidate_count"], 1);
+    let candidate = &found["candidates"][0];
+    assert_eq!(candidate["next_paragraph"], expected["next"]);
+    let fragments = candidate["fragments"].as_array().unwrap();
+    assert!(!fragments.is_empty());
+    assert!(fragments.iter().all(|f| f["pdf_page"] == expected["page"]));
+    assert!(
+        fragments
+            .iter()
+            .all(|f| f["start_line"].as_u64().unwrap() <= f["end_line"].as_u64().unwrap())
+    );
+    if expected["conditions"] == true {
+        let text = fragments
+            .iter()
+            .map(|f| f["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("(a)") && text.contains("(b)"),
+            "child conditions retained"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires hash-pinned, built snapshot with both actual readers in AASB_PUBLIC_SNAPSHOT"]
+fn official_paragraphs_have_independent_page_and_reader_confirmation() {
+    let reference: Value =
+        serde_json::from_str(include_str!("fixtures/public-references.json")).unwrap();
+    let root =
+        PathBuf::from(std::env::var_os("AASB_PUBLIC_SNAPSHOT").expect("set AASB_PUBLIC_SNAPSHOT"));
+    let sha = reference["sha256"].as_str().unwrap();
+    check_pinned_source(&root, &reference, sha);
     let call = |args: &[&str]| -> Value {
         let out = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
             .arg(args[0])
@@ -54,34 +91,7 @@ fn official_paragraphs_have_independent_page_and_reader_confirmation() {
     assert_eq!(catalogue["results"].as_array().unwrap().len(), 1);
     for expected in reference["paragraphs"].as_array().unwrap() {
         let found = call(&["paragraph", sha, expected["number"].as_str().unwrap()]);
-        assert_eq!(
-            found["status"], "found",
-            "paragraph {}: {found}",
-            expected["number"]
-        );
-        assert_eq!(found["second_reader"]["status"], "confirmed");
-        assert_eq!(found["candidate_count"], 1);
-        let candidate = &found["candidates"][0];
-        assert_eq!(candidate["next_paragraph"], expected["next"]);
-        let fragments = candidate["fragments"].as_array().unwrap();
-        assert!(!fragments.is_empty());
-        assert!(fragments.iter().all(|f| f["pdf_page"] == expected["page"]));
-        assert!(
-            fragments
-                .iter()
-                .all(|f| f["start_line"].as_u64().unwrap() <= f["end_line"].as_u64().unwrap())
-        );
-        if expected["conditions"] == true {
-            let text = fragments
-                .iter()
-                .map(|f| f["text"].as_str().unwrap())
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                text.contains("(a)") && text.contains("(b)"),
-                "child conditions retained"
-            );
-        }
+        check_paragraph(expected, &found);
     }
     let missing = call(&[
         "search",
