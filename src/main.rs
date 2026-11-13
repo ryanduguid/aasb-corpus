@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Component, Path};
 use unicode_normalization::UnicodeNormalization;
 
+mod mcp;
 mod paragraphs;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -818,7 +819,7 @@ fn run() -> Result<Value> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.len() < 2 {
         return Err(
-            "usage: aasb-corpus <build|stats|catalogue|search|paragraph|page|verify-quote|verify> SNAPSHOT [arguments]"
+            "usage: aasb-corpus <build|stats|catalogue|search|paragraph|page|verify-quote|verify|mcp> SNAPSHOT [arguments]"
                 .into(),
         );
     }
@@ -860,11 +861,19 @@ fn run() -> Result<Value> {
 }
 
 fn main() {
-    match run() {
-        Ok(value) => println!(
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // The server owns stdout, so it prints no result of its own.
+    let outcome = if arguments.len() == 2 && arguments[0] == "mcp" {
+        mcp::serve(Path::new(&arguments[1])).map(|()| None)
+    } else {
+        run().map(Some)
+    };
+    match outcome {
+        Ok(Some(value)) => println!(
             "{}",
             serde_json::to_string_pretty(&value).expect("JSON output")
         ),
+        Ok(None) => {}
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(1);
