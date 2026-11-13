@@ -18,3 +18,4 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 ref_option = "warn"
+too_many_lines = "warn"
