@@ -12,3 +12,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 unicode-normalization = "0.1.25"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+ref_option = "warn"
