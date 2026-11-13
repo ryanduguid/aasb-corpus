@@ -571,9 +571,6 @@ struct Reading {
     text: String,
 }
 
-/// Loads one PDF's independent page texts from `tools/second_reader.py`. `None` means the
-/// snapshot has no `second-reader` folder or pypdf's failure on this PDF is recorded; a
-/// changed, stale, incomplete or unknown reading is an error.
 fn check_second_reader(root: &Path, manifest: &SecondReader) -> Result<()> {
     if manifest.schema_version != 1
         || manifest.reader != "pypdf"
@@ -597,6 +594,9 @@ fn check_second_reader(root: &Path, manifest: &SecondReader) -> Result<()> {
     Ok(())
 }
 
+/// Loads one PDF's independent page texts from `tools/second_reader.py`. `None` means the
+/// snapshot has no `second-reader` folder or pypdf's failure on this PDF is recorded; a
+/// changed, stale, incomplete or unknown reading is an error.
 fn second_reading(
     root: &Path,
     sha: &str,
@@ -724,8 +724,6 @@ fn source_problems(root: &Path, sha: &str, aliases: &Value) -> Result<Vec<String
     Ok(problems)
 }
 
-/// Only an exact match on a named native page, with every source PDF file unchanged, is
-/// verified; `unverified_reasons` lists every condition that is not met.
 fn graded_pages(
     connection: &Connection,
     sha: &str,
@@ -763,6 +761,8 @@ fn graded_pages(
     Ok(pages)
 }
 
+/// Only an exact match on a named native page, with every source PDF file unchanged, is
+/// verified; `unverified_reasons` lists every condition that is not met.
 fn verify_quote(
     root: &Path,
     connection: &Connection,

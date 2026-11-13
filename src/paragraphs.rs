@@ -319,10 +319,6 @@ fn contiguous(fragment: &str, reading: &str) -> bool {
     !fragment.is_empty() && (0..reading.len()).any(matches_at)
 }
 
-/// Confirms a `found` paragraph against an independent reading of the same PDF pages.
-/// Without that reading the status becomes `found_unconfirmed`; a mismatch or a fragment
-/// without words needs review.
-/// A found result without fragments, fragment text or physical pages is an error.
 fn found_fragments(result: &Value) -> Result<Vec<(String, u64)>> {
     let mut fragments = Vec::new();
     for fragment in result["candidates"][0]["fragments"]
@@ -350,6 +346,10 @@ fn flag_for_review(result: &mut Value, reason: &str) {
     result["status"] = json!("needs_review");
 }
 
+/// Confirms a `found` paragraph against an independent reading of the same PDF pages.
+/// Without that reading the status becomes `found_unconfirmed`; a mismatch or a fragment
+/// without words needs review.
+/// A found result without fragments, fragment text or physical pages is an error.
 pub(crate) fn confirm(result: &mut Value, reading: Option<&(String, Vec<String>)>) -> Result<()> {
     if result["status"] != "found" {
         result["second_reader"] = json!({"status":"not_checked"});
