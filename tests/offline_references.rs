@@ -519,6 +519,13 @@ fn mcp_refuses_paths_unknown_tools_and_malformed_requests() {
         json!({"jsonrpc":"2.0","id":6,"method":"server/discover"}),
         json!({"id":7,"method":"ping"}),
         json!({"jsonrpc":"2.0","id":8,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}),
+        // 2025-03-26 requires accepting batches, which this server refuses.
+        json!({"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}),
+        json!([{"jsonrpc":"2.0","id":10,"method":"ping"}]),
+        json!({"jsonrpc":"2.0","id":null,"method":"ping"}),
+        json!({"jsonrpc":"2.0","id":{"n":1},"method":"ping"}),
+        json!({"jsonrpc":"2.0","id":1.5,"method":"ping"}),
+        json!({"jsonrpc":"2.0","id":"eleven","method":"ping"}),
     ];
     let mut input = mcp_lines(&requests);
     input.push_str("not json\n");
@@ -559,11 +566,23 @@ fn mcp_refuses_paths_unknown_tools_and_malformed_requests() {
     assert_eq!(replies[5]["error"]["code"], -32601);
     assert_eq!(replies[6]["error"]["code"], -32600);
     assert_eq!(replies[7]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(replies[8]["result"]["protocolVersion"], "2025-11-25");
+    // A batch, and a null, object or fractional id, are invalid requests with no id.
+    for reply in &replies[9..13] {
+        assert_eq!(
+            *reply,
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request"}})
+        );
+    }
     assert_eq!(
-        replies[8],
+        replies[13],
+        json!({"jsonrpc":"2.0","id":"eleven","result":{}})
+    );
+    assert_eq!(
+        replies[14],
         json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}})
     );
-    assert_eq!(replies.len(), 9);
+    assert_eq!(replies.len(), 15);
 }
 
 #[test]

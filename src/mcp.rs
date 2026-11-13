@@ -1,8 +1,8 @@
 //! `aasb-corpus mcp SNAPSHOT`: the read-only commands as MCP tools over stdio.
 //!
 //! One JSON-RPC message per line on stdin and stdout, as the MCP stdio transport
-//! sets out, using the `initialize` handshake of the 2025-11-25 revision and
-//! earlier. The snapshot is fixed at start-up and no tool takes a path, so a
+//! sets out, using the `initialize` handshake of revisions 2025-11-25,
+//! 2025-06-18 and 2024-11-05. The snapshot is fixed at start-up and no tool takes a path, so a
 //! call can read only that snapshot; an argument a tool does not declare is
 //! refused. Nothing is written to stderr whilst serving, so no page text reaches
 //! a log.
@@ -12,7 +12,9 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 /// The handshake revisions served, newest first.
-const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// 2025-03-26 is left out: it requires accepting JSON-RPC batches, which this
+/// server refuses.
+const VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2024-11-05"];
 
 fn tools() -> Value {
     let filters = json!({
@@ -209,10 +211,15 @@ pub fn serve(root: &Path) -> Result<()> {
             }
             Ok(message) => {
                 let method = message.get("method").and_then(Value::as_str);
-                match (message.get("id"), method) {
+                // A request id is a string or an integer, never null.
+                let id = message.get("id");
+                let valid_id = id.filter(|id| id.is_string() || id.is_i64() || id.is_u64());
+                match (id, method) {
                     // A notification, initialized included, needs no reply.
                     (None, Some(_)) => continue,
-                    (Some(id), Some(method)) if message.get("jsonrpc") == Some(&json!("2.0")) => {
+                    (Some(id), Some(method))
+                        if valid_id.is_some() && message.get("jsonrpc") == Some(&json!("2.0")) =>
+                    {
                         let params = message.get("params").cloned().unwrap_or(Value::Null);
                         match reply(root, &connection, method, &params) {
                             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -221,7 +228,7 @@ pub fn serve(root: &Path) -> Result<()> {
                             }
                         }
                     }
-                    (id, _) => json!({"jsonrpc": "2.0", "id": id.cloned().unwrap_or(Value::Null),
+                    _ => json!({"jsonrpc": "2.0", "id": valid_id.cloned().unwrap_or(Value::Null),
                         "error": {"code": -32600, "message": "invalid request"}}),
                 }
             }
