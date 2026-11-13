@@ -96,6 +96,14 @@ Only treat `found` as a located source span; the accounting conclusion remains s
 
 Without PAGE the command searches every page of the selected PDF and lists up to 20 pages with the strongest grade under `pages`, but `verified` stays false: run it again with a listed page to verify. Normalised and partial grades, OCR or review pages and searches without a page locate candidates for review. A verified match establishes textual fidelity, not accounting applicability.
 
+### Serve an MCP client
+
+```powershell
+& .\target\release\aasb-corpus.exe mcp $snapshot
+```
+
+`mcp SNAPSHOT` serves 4 read-only tools over stdio, one JSON-RPC message a line: `search_aasb_pages`, `list_aasb_documents`, `read_aasb_paragraph` and `verify_aasb_quote`. Each takes the matching command's arguments by name (`document_sha256` for the PDF hash) and returns the JSON that command prints, so the statuses and grades above apply unchanged. The snapshot is fixed at start-up and no tool takes a path; an argument a tool does not declare is refused. The server writes nothing to stderr and makes no network request, but the MCP host sends tool results, page text included, to its model.
+
 Other repositories can invoke this executable or read the SQLite database directly. Search connections are read-only. No consumer repository changes are needed to use the shared snapshot.
 
 ## Rebuild a new snapshot
