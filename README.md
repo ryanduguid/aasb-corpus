@@ -16,7 +16,7 @@ The index uses whole PDF pages. Citations use physical PDF page numbers, which c
 
 ## Run
 
-From this code directory, build the Windows executable:
+From this code directory, build the executable:
 
 ```powershell
 cargo build --locked --release
