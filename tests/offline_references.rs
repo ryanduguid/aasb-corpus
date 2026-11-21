@@ -304,6 +304,10 @@ fn stem_is_a_search_flag_with_no_value_and_only_one_use() {
 /// paths. Without strace the test skips with a message.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear strace run over every command; splitting it hides the sequence"
+)]
 fn every_command_makes_no_network_syscall() {
     if Command::new("strace").arg("-V").output().is_err() {
         eprintln!("skipped: strace is not installed");
