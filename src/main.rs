@@ -637,13 +637,17 @@ fn second_reading(
     )))
 }
 
-fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Result<Value> {
+fn aliases_metadata(connection: &Connection, sha: &str) -> Result<(String, String)> {
     valid_sha(sha)?;
-    let (aliases, metadata): (String, String) = connection.query_row(
+    Ok(connection.query_row(
         "SELECT aliases,metadata FROM documents WHERE sha256=?1",
         [sha],
         |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    )?)
+}
+
+fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Result<Value> {
+    let (aliases, metadata) = aliases_metadata(connection, sha)?;
     let mut statement = connection.prepare("SELECT page,text,provenance,needs_review FROM pages WHERE document_sha256=?1 ORDER BY page")?;
     let pages: Vec<Page> = statement
         .query_map([sha], |r| {
@@ -770,12 +774,7 @@ fn verify_quote(
     number: Option<u32>,
     quote: &str,
 ) -> Result<Value> {
-    valid_sha(sha)?;
-    let (aliases, metadata): (String, String) = connection.query_row(
-        "SELECT aliases,metadata FROM documents WHERE sha256=?1",
-        [sha],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (aliases, metadata) = aliases_metadata(connection, sha)?;
     let mut pages = graded_pages(connection, sha, number, quote)?;
     let best = pages.iter().map(grade_rank).max().unwrap_or_default();
     let mut result = if number.is_some() {
