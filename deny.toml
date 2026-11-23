@@ -1,0 +1,20 @@
+# cargo-deny checks the external dependency graph of the locked Rust crate.
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

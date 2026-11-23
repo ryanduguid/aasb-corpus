@@ -19,3 +19,8 @@ unsafe_code = "forbid"
 [lints.clippy]
 ref_option = "warn"
 too_many_lines = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
