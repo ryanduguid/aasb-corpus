@@ -54,7 +54,7 @@ $snapshot = 'C:\Users\-\Documents\AASB\corpus\2026-10-15'
 & .\target\release\aasb-corpus.exe search $snapshot '"lease liability"' --standard 'AASB 16' --version $version --limit 5
 ```
 
-Filters apply before ranking and pagination. Combining a standard with a different standard's version returns no matches; an unknown version is an error. No command determines accounting applicability from catalogue dates.
+Filters apply before ranking and pagination. Combining a standard with a different standard's version returns no matches; an unknown version is an error. No command determines accounting applicability from catalogue dates. From schema 4 each catalogue result also carries the `validity` and `reporting_tier` described under 'Facts derived at build'.
 
 ### Look up a paragraph
 
@@ -81,6 +81,18 @@ Only treat `found` as a located source span; the accounting conclusion remains s
 `paragraph SNAPSHOT SHA256 LABEL --context N` also returns up to N (1 to 5) neighbouring paragraphs on each side of every candidate, in reading order, under the candidate's `context` (`before`, `after` and its own `ordinal`). Neighbours carry the same spans, hashes and review flags as a lookup, but the second reader does not check them: look one up to confirm it. A condition in an adjacent paragraph then arrives with the paragraph that depends on it.
 
 `build` stores every anchored paragraph with the candidate lookup reports for it, so lookups read the table instead of re-scanning pages. `verify` re-derives every document's paragraphs from its indexed pages and fails if the table differs. An index without the table (schema 1 or 2) still answers `paragraph` from its pages and refuses `--context`. On the `2026-10-15` snapshot the table holds 26,009 paragraphs and the index grows from 43 MB to 124 MB; 1,950 sampled labels returned identical output from the table and from the pages.
+
+### Facts derived at build
+
+From schema 4, `build` also records 3 facts from the snapshot's own sources, and `paragraph` returns them. Where a source does not state a fact, it stays empty; nothing is inferred.
+
+- `cited_by`: pages of other standards' documents whose text cites this paragraph as `paragraph 26 of AASB 16`, `paragraphs 26, 27 and Aus27.1 of AASB 16` or `paragraphs B19–B21 of AASB 3`, grouped by the citing document's kind from its catalogue rows: `interpretations`, `agenda_decisions`, `amending_standards`, `standards` and `other`, with a `total` and at most 20 of each kind. A range cites only its endpoints and `35(a)` cites `35`. A citation names a standard, not a version, so it links to the label in every captured version; check the numbering in the version you cite. Versions of the same standard are left out. The `2026-10-15` snapshot holds no Interpretation or agenda decision document, so those 2 lists are empty there; a snapshot that adds them fills them on rebuild.
+- `reporting_tier`: the tier a catalogue title states (`Tier 2 Entities` or a closing `Tier 2 Disclosures`, and likewise Tier 3), with that title as `basis`. Titles that state no tier, or a mixed one such as `Tier 2 and Other`, leave it null. The standards' appendices on simplified disclosures hold almost no numbered paragraphs, so the tier is recorded per document, not per paragraph.
+- `validity`: the mandatory periods the catalogue's `applies_to_periods_text` states (`applies_from`, `applies_before`, `periods_ending_before`, `periods_ending_on_or_after`) and a `status` at the catalogue's `retrieved_date` (`as_at`): `not_yet_effective` when no period may yet begin, `superseded` once a period beginning that day is no longer covered, otherwise `current`. An early-application sentence is not read. The status is null when a row states a date in a form not read, or when rows for one PDF give different statuses; the dates are null when those rows state different periods. `superseded_by` lists versions of the same standard whose periods begin on this version's `applies_before`. It restates catalogue text; it does not decide which version applies to a reporting period.
+
+On the `2026-10-15` snapshot with the 21 November catalogue correction, the build found 4,285 citations of 56 standards (3,920 from standards, 361 from amending standards and 4 from other documents). Of the 190 documents, 71 were `current`, 103 `superseded`, 11 `not_yet_effective` and 5 without a status. 8 AASB 1060 documents state Tier 2 and 1 AASB 1061 document states Tier 3.
+
+An index before schema 4 omits these fields.
 
 `page SNAPSHOT SHA256 PAGE` returns a full extracted page.
 

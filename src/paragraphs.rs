@@ -2,7 +2,7 @@ use crate::{Page, Result, hash};
 use serde_json::{Value, json};
 
 // Labels identify extracted text; uncertain boundaries must remain review items.
-fn valid_label(label: &str) -> bool {
+pub(crate) fn valid_label(label: &str) -> bool {
     let value = label.strip_prefix("Aus").unwrap_or(label);
     let prefix = value.bytes().take_while(u8::is_ascii_uppercase).count();
     if prefix > 3 {

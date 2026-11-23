@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Component, Path};
 use unicode_normalization::UnicodeNormalization;
 
+mod derived;
 mod mcp;
 mod paragraphs;
 
@@ -167,7 +168,14 @@ fn schema(connection: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE paragraphs_fts USING fts5(text, content='paragraphs', content_rowid='id');
         CREATE VIRTUAL TABLE paragraphs_stem USING fts5(text, content='paragraphs', content_rowid='id',
             tokenize='porter unicode61');
-        PRAGMA user_version=3;
+        CREATE TABLE document_facts(document_sha256 TEXT PRIMARY KEY REFERENCES documents(sha256),
+            validity TEXT NOT NULL, reporting_tier TEXT NOT NULL);
+        CREATE TABLE citations(id INTEGER PRIMARY KEY,
+            citing_document_sha256 TEXT NOT NULL REFERENCES documents(sha256),
+            pdf_page INTEGER NOT NULL, line INTEGER NOT NULL, cited_standard TEXT NOT NULL,
+            cited_label TEXT NOT NULL, kind TEXT NOT NULL);
+        CREATE INDEX citations_cited ON citations(cited_standard,cited_label);
+        PRAGMA user_version=4;
     ")?;
     Ok(())
 }
@@ -225,21 +233,7 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
             .ok_or("missing or duplicate document identity")?;
         page_count += index_document(&transaction, root, &catalogue, document, &aliases)?;
     }
-    for table in [
-        "pages_fts",
-        "pages_stem",
-        "paragraphs_fts",
-        "paragraphs_stem",
-    ] {
-        transaction.execute(
-            &format!("INSERT INTO {table}({table}) VALUES('rebuild')"),
-            [],
-        )?;
-        transaction.execute(
-            &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
-            [],
-        )?;
-    }
+    finish_tables(&transaction, &catalogue)?;
     transaction.commit()?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -250,6 +244,26 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
     Ok(
         json!({"documents":extraction.documents.len(),"source_files":sources.files.len(),"pages":page_count,"index":target}),
     )
+}
+
+/// Builds and checks the search tables, then stores the facts that need every document.
+fn finish_tables(connection: &Connection, catalogue: &Value) -> Result<()> {
+    for table in [
+        "pages_fts",
+        "pages_stem",
+        "paragraphs_fts",
+        "paragraphs_stem",
+    ] {
+        connection.execute(
+            &format!("INSERT INTO {table}({table}) VALUES('rebuild')"),
+            [],
+        )?;
+        connection.execute(
+            &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
+            [],
+        )?;
+    }
+    insert_facts(connection, catalogue)
 }
 
 fn group_sources<'a>(
@@ -353,19 +367,168 @@ fn index_document(
         .iter()
         .map(|source| json!({"filename":source.filename,"source_url":source.source_url}))
         .collect();
+    let metadata = metadata_for(catalogue, aliases);
     connection.execute(
         "INSERT INTO documents VALUES (?1,?2,?3,?4,?5)",
         params![
             document.sha256,
             document.page_count,
             serde_json::to_string(&alias_json)?,
-            serde_json::to_string(&metadata_for(catalogue, aliases))?,
+            serde_json::to_string(&metadata)?,
             document.pages_sha256
         ],
     )?;
     let pages = insert_pages(connection, document, &page_path)?;
     insert_paragraphs(connection, &document.sha256, &pages)?;
+    insert_citations(connection, &document.sha256, &metadata, &pages)?;
     Ok(u64::from(document.page_count))
+}
+
+/// Stores each paragraph the document's pages cite, with the kind of citing document.
+fn insert_citations(
+    connection: &Connection,
+    sha: &str,
+    metadata: &[Value],
+    pages: &[Page],
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "INSERT INTO citations(citing_document_sha256,pdf_page,line,cited_standard,cited_label,kind)
+        VALUES (?1,?2,?3,?4,?5,?6)",
+    )?;
+    let kind = derived::kind(metadata);
+    for citation in derived::citations(pages) {
+        statement.execute(params![
+            sha,
+            citation.pdf_page,
+            i64::try_from(citation.line)?,
+            standard_key(&citation.standard),
+            citation.label,
+            kind
+        ])?;
+    }
+    Ok(())
+}
+
+/// The principal standards a document's catalogue rows name, as `standard_key`s.
+fn standard_keys(metadata: &[Value]) -> Vec<String> {
+    metadata
+        .iter()
+        .filter_map(|row| row["standard"].as_str())
+        .map(standard_key)
+        .collect()
+}
+
+/// Stores each document's validity and reporting tier. A version is superseded by the
+/// versions of the same standard whose stated periods begin on its stated end date.
+fn insert_facts(connection: &Connection, catalogue: &Value) -> Result<()> {
+    let mut statement = connection.prepare("SELECT sha256,metadata FROM documents")?;
+    let mut facts = Vec::new();
+    for row in statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (sha, metadata) = row?;
+        let metadata: Vec<Value> = serde_json::from_str(&metadata)?;
+        let validity = derived::validity(catalogue, &metadata);
+        facts.push((
+            sha,
+            standard_keys(&metadata),
+            validity,
+            derived::reporting_tier(catalogue, &metadata),
+        ));
+    }
+    for index in 0..facts.len() {
+        let (_, keys, validity, _) = &facts[index];
+        let successors: Vec<&String> = facts
+            .iter()
+            .filter(|(_, other_keys, other, _)| {
+                validity["applies_before"].is_string()
+                    && other["applies_from"] == validity["applies_before"]
+                    && other_keys.iter().any(|key| keys.contains(key))
+            })
+            .map(|(sha, _, _, _)| sha)
+            .collect();
+        let successors = json!(successors);
+        facts[index].2["superseded_by"] = successors;
+    }
+    for (sha, _, validity, tier) in facts {
+        connection.execute(
+            "INSERT INTO document_facts VALUES (?1,?2,?3)",
+            params![sha, validity.to_string(), tier.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// A document's stored validity and reporting tier; `None` before schema 4.
+fn document_facts(connection: &Connection, sha: &str) -> Result<Option<(Value, Value)>> {
+    if schema_version(connection)? < 4 {
+        return Ok(None);
+    }
+    let (validity, tier): (String, String) = connection.query_row(
+        "SELECT validity,reporting_tier FROM document_facts WHERE document_sha256=?1",
+        [sha],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(Some((
+        serde_json::from_str(&validity)?,
+        serde_json::from_str(&tier)?,
+    )))
+}
+
+const DERIVED_BOUNDARY: &str = "validity restates the catalogue's period text against its retrieval date (as_at); it does not decide which version applies to a reporting period. reporting_tier is what a catalogue title states, and null where no title states one. cited_by lists pages of other standards' documents whose text cites this standard and label; a citation names no version, and a range cites only its endpoints.";
+
+/// The pages of other documents whose text cites `label` of this document's standard,
+/// grouped by the citing document's kind; at most 20 of each kind.
+fn cited_by(connection: &Connection, metadata: &[Value], label: &str) -> Result<Value> {
+    let keys = standard_keys(metadata);
+    let mut statement = connection.prepare(
+        "SELECT c.citing_document_sha256,c.pdf_page,c.line,c.kind,d.metadata FROM citations c
+        JOIN documents d ON d.sha256=c.citing_document_sha256
+        WHERE c.cited_standard IN (SELECT value FROM json_each(?1)) AND c.cited_label=?2
+        ORDER BY c.kind,c.citing_document_sha256,c.pdf_page,c.line",
+    )?;
+    let mut groups: BTreeMap<&str, Vec<Value>> = [
+        "interpretation",
+        "agenda_decision",
+        "amending_standard",
+        "standard",
+        "other",
+    ]
+    .into_iter()
+    .map(|kind| (kind, Vec::new()))
+    .collect();
+    let mut total = 0;
+    let rows = statement.query_map(params![serde_json::to_string(&keys)?, label], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, u32>(1)?,
+            r.get::<_, u32>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (sha, page, line, kind, citing) = row?;
+        let citing: Vec<Value> = serde_json::from_str(&citing)?;
+        // Other versions of the same standard cite their own paragraphs.
+        if standard_keys(&citing).iter().any(|key| keys.contains(key)) {
+            continue;
+        }
+        total += 1;
+        let title = citing
+            .first()
+            .map(|row| row.get("version_label").unwrap_or(&row["title"]).clone());
+        if let Some(group) = groups
+            .get_mut(kind.as_str())
+            .filter(|group| group.len() < 20)
+        {
+            group.push(json!({"document_sha256":sha,"pdf_page":page,"line":line,"title":title}));
+        }
+    }
+    let shown: usize = groups.values().map(Vec::len).sum();
+    Ok(
+        json!({"interpretations":groups["interpretation"],"agenda_decisions":groups["agenda_decision"],
+        "amending_standards":groups["amending_standard"],"standards":groups["standard"],
+        "other":groups["other"],"total":total,"truncated":shown < total}),
+    )
 }
 
 fn schema_version(connection: &Connection) -> Result<i64> {
@@ -377,7 +540,7 @@ fn open(root: &Path) -> Result<Connection> {
         Connection::open_with_flags(root.join("index.sqlite3"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     // Version 1 lacks the stem table and version 2 the paragraph table; both stay usable,
     // so citations keep their index digests.
-    if !(1..=3).contains(&schema_version(&connection)?) {
+    if !(1..=4).contains(&schema_version(&connection)?) {
         return Err("unsupported corpus schema".into());
     }
     Ok(connection)
@@ -508,8 +671,13 @@ fn matching_documents(connection: &Connection, options: &QueryOptions) -> Result
         }) {
             continue;
         }
-        documents.push(json!({"document_sha256":sha,"page_count":count,
-            "sources":serde_json::from_str::<Value>(&aliases)?,"version_metadata":metadata}));
+        let mut document = json!({"document_sha256":sha,"page_count":count,
+            "sources":serde_json::from_str::<Value>(&aliases)?,"version_metadata":metadata});
+        if let Some((validity, tier)) = document_facts(connection, &sha)? {
+            document["validity"] = validity;
+            document["reporting_tier"] = tier;
+        }
+        documents.push(document);
     }
     if !version_exists {
         return Err("version is not present in this snapshot".into());
@@ -530,7 +698,7 @@ fn catalogue(connection: &Connection, options: &QueryOptions) -> Result<Value> {
         json!({"results":results,"filters":options.filters(),"total_documents":total,
         "limit":options.limit,"offset":options.offset,"has_more":has_more,
         "next_offset":has_more.then_some(options.offset + i64::from(options.limit)),
-        "boundary":"Version identifiers are exact PDF hashes. Catalogue dates do not determine applicability. Standard filters select principal documents, not related amendments."}),
+        "boundary":"Version identifiers are exact PDF hashes. Catalogue dates do not determine applicability; validity only restates them against the catalogue's retrieval date. Standard filters select principal documents, not related amendments."}),
     )
 }
 
@@ -857,6 +1025,13 @@ fn paragraph(
     }
     if let Some(context) = context {
         add_context(connection, sha, &mut result, &ordinals, context)?;
+    }
+    if let Some((validity, tier)) = document_facts(connection, sha)? {
+        let metadata: Vec<Value> = serde_json::from_str(&metadata)?;
+        result["cited_by"] = cited_by(connection, &metadata, label)?;
+        result["validity"] = validity;
+        result["reporting_tier"] = tier;
+        result["derived_boundary"] = json!(DERIVED_BOUNDARY);
     }
     result["document_sha256"] = json!(sha);
     result["sources"] = sources;
@@ -1455,9 +1630,12 @@ mod tests {
     fn lookup_35(root: &Path, connection: &Connection, sha: &str) -> Result<Value> {
         paragraph(root, connection, sha, "35", None)
     }
-    /// Stores the paragraphs of the pages inserted so far, as `build` does.
+    /// Stores the paragraphs and document facts of what was inserted so far, as `build` does.
     fn store_paragraphs(connection: &Connection) {
-        connection.execute("DELETE FROM paragraphs", []).unwrap();
+        connection
+            .execute_batch("DELETE FROM paragraphs; DELETE FROM document_facts;")
+            .unwrap();
+        insert_facts(connection, &json!({})).unwrap();
         let mut statement = connection.prepare("SELECT sha256 FROM documents").unwrap();
         let documents: Vec<String> = statement
             .query_map([], |r| r.get(0))
@@ -1617,6 +1795,7 @@ mod tests {
         connection
             .execute("INSERT INTO pages_fts(pages_fts) VALUES('rebuild')", [])
             .unwrap();
+        store_paragraphs(&connection);
         connection
     }
 
