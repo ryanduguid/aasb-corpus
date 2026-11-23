@@ -901,3 +901,25 @@ fn paragraphs_carry_their_citations_validity_and_stated_tier() {
         found["reporting_tier"]
     );
 }
+
+/// The live reference test reads this file; check its shape offline.
+#[test]
+fn reference_questions_are_well_formed_and_cover_aasb_s2() {
+    let questions = include_str!("fixtures/reference-questions.tsv");
+    let rows: Vec<Vec<&str>> = questions
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split('\t').collect())
+        .collect();
+    for row in &rows {
+        assert_eq!(row.len(), 3, "{row:?}");
+        assert!(row.iter().all(|field| !field.trim().is_empty()), "{row:?}");
+        assert!(row[1].starts_with("AASB "), "{row:?}");
+    }
+    let s2: BTreeSet<&str> = rows
+        .iter()
+        .filter(|row| row[1] == "AASB S2")
+        .map(|row| row[2])
+        .collect();
+    assert_eq!(s2, BTreeSet::from(["3", "AusC1.1", "BC88"]));
+}

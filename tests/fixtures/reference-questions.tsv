@@ -28,3 +28,16 @@ key management personnel compensation	AASB 124	17
 functional currency primary economic environment	AASB 121	9
 power investee variable returns controls	AASB 10	7
 acquisition method business combinations	AASB 3	4
+# AASB S2 (added 24 November 2026): scope, mandatory start and who must report when.
+# AASB S2 sets its scope (paragraph 3) and an effective date (AusC1.1: annual periods beginning on or after 1 January 2025).
+# BC88 says the Corporations Act sets the year an entity first applies it. Read at legislation.gov.au, Corporations Act 2001
+# Compilation No. 149 (19 September 2026): Schedule 4 to Act No. 87 of 2024 commenced on 18 September 2024, so the s 1707 start
+# date is 1 January 2025. s 1707B(1)(a), (2), (4): years starting 1 January 2025 to 30 June 2026 if 2 of revenue $500m,
+# gross assets $1bn, 500 employees, or an NGER reporter over the publication threshold (not a scheme, super fund or retail CCIV).
+# s 1707B(1)(b) with s 296B(2), (4), (5): years starting 1 July 2026 to 30 June 2027 if 2 of $200m, $500m, 250 employees,
+# an NGER registrant, or a scheme, super fund or retail CCIV with assets of $5bn. s 1707B(1)(c) with s 292A(3), (5), (6):
+# years starting on or after 1 July 2027 if 2 of $50m, $25m, 100 employees (unless regulations prescribe others), an NGER
+# registrant, or such an asset owner with $5bn. These are the phases often called Groups 1, 2 and 3.
+standard applies "climate-related" risks opportunities exposed	AASB S2	3
+annual reporting periods beginning 2025 earlier application	AASB S2	AusC1.1
+first required apply Corporations Act financial period	AASB S2	BC88
