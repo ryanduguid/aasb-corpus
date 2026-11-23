@@ -55,6 +55,11 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with(&DOCUMENTS)
+    }
+
+    /// A one-page PDF per `(name, standard, version label, page text)`.
+    fn with(documents: &[(&str, &str, &str, &str)]) -> Self {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -68,7 +73,7 @@ impl Fixture {
         let mut sources = Vec::new();
         let mut extracted = Vec::new();
         let mut versions = Vec::new();
-        for (name, standard, label, text) in DOCUMENTS {
+        for &(name, standard, label, text) in documents {
             let bytes = source(name);
             let sha = hash(&bytes);
             let url = format!("https://example.invalid/{name}.pdf");
@@ -591,4 +596,195 @@ fn mcp_needs_a_built_snapshot_before_serving() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+const CONTEXT_DOCUMENTS: [(&str, &str, &str, &str); 2] = [
+    (
+        "sequence",
+        "AASB 16",
+        "Fabricated sequence",
+        "24 Fabricated opening paragraph.\n25 Fabricated second requirement.\n26 Fabricated amber lease requirement.\n27 Fabricated fourth requirement.\n28 Fabricated closing paragraph.",
+    ),
+    (
+        "repeat",
+        "AASB 1",
+        "Fabricated repeat",
+        "5 Fabricated opening note.\n6 Fabricated violet note.\n5 Fabricated repeated note.\n6 Fabricated violet guidance.",
+    ),
+];
+
+/// The stderr of a command that must fail.
+fn failure(arguments: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{arguments:?}");
+    String::from_utf8(output.stderr).unwrap()
+}
+
+fn context_labels(candidate: &Value, side: &str) -> Vec<String> {
+    candidate["context"][side]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["paragraph"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn paragraph_context_returns_neighbouring_paragraphs_from_the_build_time_table() {
+    let fixture = Fixture::with(&CONTEXT_DOCUMENTS);
+    fixture.call("build", &[]);
+    assert_eq!(fixture.call("stats", &[])["paragraphs"], 9);
+    let sha = hash(&source("sequence"));
+    let plain = fixture.call("paragraph", &[&sha, "26"]);
+    assert!(plain["candidates"][0].get("context").is_none());
+    let one = fixture.call("paragraph", &[&sha, "26", "--context", "1"]);
+    assert_eq!(one["status"], "found_unconfirmed");
+    let candidate = &one["candidates"][0];
+    assert_eq!(candidate["context"]["ordinal"], 2);
+    assert_eq!(context_labels(candidate, "before"), ["25"]);
+    assert_eq!(context_labels(candidate, "after"), ["27"]);
+    let before = &candidate["context"]["before"][0];
+    assert_eq!(
+        before["fragments"][0]["text"],
+        "25 Fabricated second requirement."
+    );
+    assert_eq!(before["fragments"][0]["start_line"], 2);
+    assert_eq!(before["next_paragraph"], "26");
+    assert!(
+        one["context_boundary"]
+            .as_str()
+            .unwrap()
+            .contains("second reader")
+    );
+    // The paragraph itself is unchanged by the context option.
+    let mut without = one.clone();
+    without["candidates"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("context");
+    without.as_object_mut().unwrap().remove("context_boundary");
+    assert_eq!(without, plain);
+    // Context stops at the ends of the document.
+    let end = fixture.call("paragraph", &[&sha, "27", "--context", "2"]);
+    assert_eq!(
+        context_labels(&end["candidates"][0], "before"),
+        ["25", "26"]
+    );
+    assert_eq!(context_labels(&end["candidates"][0], "after"), ["28"]);
+    let start = fixture.call("paragraph", &[&sha, "24", "--context", "1"]);
+    assert!(context_labels(&start["candidates"][0], "before").is_empty());
+}
+
+#[test]
+fn a_repeated_label_keeps_one_context_per_candidate_and_counts_are_bounded() {
+    let fixture = Fixture::with(&CONTEXT_DOCUMENTS);
+    fixture.call("build", &[]);
+    let sha = hash(&source("sequence"));
+    let repeat = hash(&source("repeat"));
+    let ambiguous = fixture.call("paragraph", &[&repeat, "5", "--context", "1"]);
+    assert_eq!(ambiguous["status"], "ambiguous");
+    let candidates = ambiguous["candidates"].as_array().unwrap();
+    assert!(context_labels(&candidates[0], "before").is_empty());
+    assert_eq!(context_labels(&candidates[0], "after"), ["6"]);
+    assert_eq!(context_labels(&candidates[1], "before"), ["6"]);
+    assert_eq!(context_labels(&candidates[1], "after"), ["6"]);
+    let root = fixture.0.to_str().unwrap();
+    for bad in ["0", "6", "x"] {
+        failure(&["paragraph", root, &sha, "26", "--context", bad]);
+    }
+    failure(&["paragraph", root, &sha, "26", "--stem", "1"]);
+}
+
+#[test]
+fn paragraph_search_returns_labelled_paragraphs() {
+    let fixture = Fixture::with(&CONTEXT_DOCUMENTS);
+    fixture.call("build", &[]);
+    let sha = hash(&source("sequence"));
+    let found = fixture.call("search", &["amber", "--paragraphs"]);
+    let results = found["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["document_sha256"], sha);
+    assert_eq!(results[0]["paragraph"], "26");
+    assert_eq!(results[0]["ordinal"], 2);
+    assert_eq!(results[0]["pdf_page"], 1);
+    assert!(results[0]["snippet"].as_str().unwrap().contains("[amber]"));
+    assert_eq!(found["paragraphs"], true);
+    let filtered = fixture.call(
+        "search",
+        &["violet", "--paragraphs", "--standard", "AASB 16"],
+    );
+    assert!(filtered["results"].as_array().unwrap().is_empty());
+    let stemmed = fixture.call("search", &["requirements", "--paragraphs", "--stem"]);
+    let labels: BTreeSet<_> = stemmed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["paragraph"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        labels,
+        BTreeSet::from(["25".into(), "26".into(), "27".into()])
+    );
+    let root = fixture.0.to_str().unwrap();
+    failure(&["search", root, "amber", "--paragraphs", "--paragraphs"]);
+    failure(&["search", root, "amber", "--paragraphs", "yes"]);
+}
+
+#[test]
+fn an_older_index_answers_paragraphs_from_pages_and_refuses_the_table_options() {
+    let fixture = Fixture::with(&CONTEXT_DOCUMENTS);
+    fixture.call("build", &[]);
+    let sha = hash(&source("sequence"));
+    let repeat = hash(&source("repeat"));
+    let current = [
+        fixture.call("paragraph", &[&sha, "26"]),
+        fixture.call("paragraph", &[&repeat, "6"]),
+    ];
+    let connection = rusqlite::Connection::open(fixture.0.join("index.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE paragraphs_fts; DROP TABLE paragraphs_stem; DROP TABLE paragraphs;
+            PRAGMA user_version=2;",
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(fixture.call("paragraph", &[&sha, "26"]), current[0]);
+    assert_eq!(fixture.call("paragraph", &[&repeat, "6"]), current[1]);
+    assert!(fixture.call("stats", &[]).get("paragraphs").is_none());
+    let root = fixture.0.to_str().unwrap();
+    for arguments in [
+        vec!["paragraph", root, &sha, "26", "--context", "1"],
+        vec!["search", root, "amber", "--paragraphs"],
+    ] {
+        assert!(
+            failure(&arguments).contains("no paragraph table"),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_paragraph_context_and_search_match_the_commands() {
+    let fixture = Fixture::with(&CONTEXT_DOCUMENTS);
+    fixture.call("build", &[]);
+    let sha = hash(&source("sequence"));
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_aasb_paragraph",
+            "arguments":{"document_sha256":sha,"label":"26","context":1}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_aasb_pages",
+            "arguments":{"query":"amber","paragraphs":true}}}),
+    ];
+    let (replies, stderr) = mcp(&fixture.0, &requests);
+    assert_eq!(stderr, "");
+    let commands = [
+        fixture.call("paragraph", &[&sha, "26", "--context", "1"]),
+        fixture.call("search", &["amber", "--paragraphs"]),
+    ];
+    for (reply, command) in replies.iter().zip(commands) {
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(reply["result"]["structuredContent"], command);
+    }
 }

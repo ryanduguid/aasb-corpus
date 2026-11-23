@@ -12,7 +12,7 @@ Data: `C:\Users\-\Documents\AASB\corpus\2026-10-15`.
 
 The snapshot preserves `source/`, its download manifest and `catalogue.json`. Extraction produces `extracted/<PDF SHA-256>/pages.jsonl` and `document.md`, plus an extraction manifest. Exact duplicate source files share one extraction; all original filename and URL aliases remain in the index. All source pages, including copyright notices and compilation information, remain in the extracted documents.
 
-The index uses whole PDF pages. Citations use physical PDF page numbers, which can differ from printed page labels. Paragraph lookup identifies line anchors in one exact captured PDF and retains source spans and review flags. Amendments are not compiled into another version.
+The index holds whole PDF pages and, from schema 3, a paragraph table built from them. Citations use physical PDF page numbers, which can differ from printed page labels. Paragraph lookup identifies line anchors in one exact captured PDF and retains source spans and review flags. Amendments are not compiled into another version.
 
 ## Run
 
@@ -35,6 +35,8 @@ Search locally:
 `search` accepts SQLite FTS5 query syntax and matches the words as written; `--stem` also matches other forms of each word, so `leases` finds `leased`. It returns 20 ranked results by default. `--limit` accepts 1 to 100 and `--offset` starts at zero. Results include `has_more` and `next_offset`; continue with that offset and the same query, filters and unchanged snapshot. Ordering is by search rank, document hash and physical page.
 
 A stemmed search finds candidates; its results carry `stemmed` and `stem_boundary`, and any quotation still goes through `verify-quote`. `--stem` needs an index built with the stem table. An older index keeps working for exact search and stops `--stem` with an error. To add the table, move `index.sqlite3` out of the snapshot, run `build`, run `verify` and keep the new `index_sha256`: citations made against the old index keep the old digest, so keep that file too.
+
+`--paragraphs` ranks stored paragraphs instead of pages, with or without `--stem`. Each result names its `paragraph` label, its reading-order `ordinal` in the PDF and the physical page of its anchor; look the label up with `paragraph` before relying on it. Every query word must fall within one paragraph, so a page search can find a requirement whose words span 2 paragraphs where a paragraph search does not. `--paragraphs` needs an index with the paragraph table (schema 3); rebuild an older index as above to add it.
 
 ### Choose a standard and PDF version
 
@@ -76,6 +78,10 @@ Once `second-reader/` exists, its manifest must have the supported schema and re
 
 Only treat `found` as a located source span; the accounting conclusion remains separate. Lookup excludes recognised contents pages, bounds output to 20 candidates and withholds candidate text above 64 KiB whilst preserving page references. Unsupported layouts require reading the cited PDF pages. No general PDF-layout accuracy is claimed.
 
+`paragraph SNAPSHOT SHA256 LABEL --context N` also returns up to N (1 to 5) neighbouring paragraphs on each side of every candidate, in reading order, under the candidate's `context` (`before`, `after` and its own `ordinal`). Neighbours carry the same spans, hashes and review flags as a lookup, but the second reader does not check them: look one up to confirm it. A condition in an adjacent paragraph then arrives with the paragraph that depends on it.
+
+`build` stores every anchored paragraph with the candidate lookup reports for it, so lookups read the table instead of re-scanning pages. `verify` re-derives every document's paragraphs from its indexed pages and fails if the table differs. An index without the table (schema 1 or 2) still answers `paragraph` from its pages and refuses `--context`. On the `2026-10-15` snapshot the table holds 26,009 paragraphs and the index grows from 43 MB to 124 MB; 1,950 sampled labels returned identical output from the table and from the pages.
+
 `page SNAPSHOT SHA256 PAGE` returns a full extracted page.
 
 ### Check a quotation
@@ -102,7 +108,7 @@ Without PAGE the command searches every page of the selected PDF and lists up to
 & .\target\release\aasb-corpus.exe mcp $snapshot
 ```
 
-`mcp SNAPSHOT` serves 4 read-only tools over stdio, one JSON-RPC message a line: `search_aasb_pages`, `list_aasb_documents`, `read_aasb_paragraph` and `verify_aasb_quote`. It accepts the `initialize` handshake of MCP revisions 2025-11-25, 2025-06-18 and 2024-11-05, and refuses JSON-RPC batches, so it does not offer 2025-03-26, which requires them. Each takes the matching command's arguments by name (`document_sha256` for the PDF hash) and returns the JSON that command prints, so the statuses and grades above apply unchanged. The snapshot is fixed at start-up and no tool takes a path; an argument a tool does not declare is refused. Once serving, the server writes nothing to stderr; a start-up failure, such as an unbuilt snapshot, is reported there before it exits. It makes no network request, but the MCP host sends tool results, page text included, to its model.
+`mcp SNAPSHOT` serves 4 read-only tools over stdio, one JSON-RPC message a line: `search_aasb_pages`, `list_aasb_documents`, `read_aasb_paragraph` and `verify_aasb_quote`. It accepts the `initialize` handshake of MCP revisions 2025-11-25, 2025-06-18 and 2024-11-05, and refuses JSON-RPC batches, so it does not offer 2025-03-26, which requires them. Each takes the matching command's arguments by name (`document_sha256` for the PDF hash, `context` for `--context`, and `stem` and `paragraphs` as booleans) and returns the JSON that command prints, so the statuses and grades above apply unchanged. The snapshot is fixed at start-up and no tool takes a path; an argument a tool does not declare is refused. Once serving, the server writes nothing to stderr; a start-up failure, such as an unbuilt snapshot, is reported there before it exits. It makes no network request, but the MCP host sends tool results, page text included, to its model.
 
 Other repositories can invoke this executable or read the SQLite database directly. Search connections are read-only. No consumer repository changes are needed to use the shared snapshot.
 
@@ -137,9 +143,11 @@ AASB_TEST_SNAPSHOT=/path/to/snapshot cargo test --locked --test local_snapshot -
 
 Ordinary tests use fabricated text. The live check stays local and prints counts and statuses only.
 
-The same command also runs the reference questions in `tests/fixtures/reference-questions.tsv`: for each question it looks up the expected paragraph in every version of the standard, then counts how often exact and stemmed search put that paragraph's page in the top 5 and top 20. An index without the stem table counts exact search only. The counts measure this question set, not general recall, and the file holds only short queries and paragraph labels.
+The same command also runs the reference questions in `tests/fixtures/reference-questions.tsv`: for each question it looks up the expected paragraph in every version of the standard, then counts how often exact and stemmed search put that paragraph's page in the top 5 and top 20, and how often paragraph search returns its label there. An index without the stem table counts exact page search only; one without the paragraph table skips paragraph search. The counts measure this question set, not general recall, and the file holds only short queries and paragraph labels.
 
 On 13 November 2026 the `2026-10-15` snapshot (`index_sha256` `114641a50b25524d217fcbd143b6b36bd03472f80d5b6d29f321b152965f88dc`) gave these counts for the 28 questions. The 81 paragraph lookups, one for each version of each question's standard, were 46 `found`, 6 `ambiguous`, 22 `needs_review` and 7 `not_found`. 74 of them located a page, and exact search put that page in the top 5 for 46 and in the top 20 for 56. Stemmed search was not counted: that index predates the stem table.
+
+On 24 November 2026 the same snapshot rebuilt at schema 3 (`index_sha256` `66d6efb478a9f3ad02fce6190ec9b138998a499bcc65aa189136691095a47a40`) gave the same lookup statuses and exact page counts. Stemmed page search put the page in the top 5 for 68 and the top 20 for 72; paragraph search returned the label in the top 5 for 39 and the top 20 for 42, or 59 and 67 stemmed.
 
 ## Reuse and licence
 

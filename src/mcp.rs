@@ -6,7 +6,9 @@
 //! call can read only that snapshot; an argument a tool does not declare is
 //! refused. Nothing is written to stderr whilst serving, so no page text reaches
 //! a log.
-use super::{QueryOptions, Result, catalogue, open, paragraph, search, verify_quote};
+use super::{
+    QueryOptions, Result, catalogue, context_count, open, paragraph, search, verify_quote,
+};
 use serde_json::{Map, Value, json};
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -32,6 +34,10 @@ fn tools() -> Value {
         "stem".into(),
         json!({"type": "boolean", "default": false, "description": "Also match other forms of each word"}),
     );
+    search_properties.insert(
+        "paragraphs".into(),
+        json!({"type": "boolean", "default": false, "description": "Rank stored paragraphs, with their labels, instead of pages"}),
+    );
     let document =
         json!({"type": "string", "description": "The document_sha256 of one captured PDF"});
     json!([
@@ -45,7 +51,8 @@ fn tools() -> Value {
          "annotations": {"readOnlyHint": true, "openWorldHint": false}},
         {"name": "read_aasb_paragraph",
          "description": "Look up a paragraph label in one captured PDF; only status found is a located source span.",
-         "inputSchema": {"type": "object", "properties": {"document_sha256": document, "label": {"type": "string", "description": "Such as 26, B19, Aus25.1 or BC1"}},
+         "inputSchema": {"type": "object", "properties": {"document_sha256": document, "label": {"type": "string", "description": "Such as 26, B19, Aus25.1 or BC1"},
+                         "context": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Neighbouring paragraphs to return on each side"}},
                          "required": ["document_sha256", "label"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "openWorldHint": false}},
         {"name": "verify_aasb_quote",
@@ -107,6 +114,21 @@ fn options(arguments: &Map<String, Value>) -> Result<QueryOptions> {
     QueryOptions::parse(&words)
 }
 
+fn read_paragraph(root: &Path, connection: &rusqlite::Connection, call: &Value) -> Result<Value> {
+    let a = arguments(call, &["document_sha256", "label"], &["context"], &[])?;
+    let context = match a.get("context") {
+        Some(count) => context_count(&["--context".into(), count.to_string()])?,
+        None => None,
+    };
+    paragraph(
+        root,
+        connection,
+        required(&a, "document_sha256")?,
+        required(&a, "label")?,
+        context,
+    )
+}
+
 fn call_tool(
     root: &Path,
     connection: &rusqlite::Connection,
@@ -116,24 +138,25 @@ fn call_tool(
     const PAGING: [&str; 2] = ["limit", "offset"];
     match name {
         "search_aasb_pages" => {
-            let a = arguments(call, &["query", "standard", "version"], &PAGING, &["stem"])?;
+            let a = arguments(
+                call,
+                &["query", "standard", "version"],
+                &PAGING,
+                &["stem", "paragraphs"],
+            )?;
             let mut options = options(&a)?;
             options.stem = a.get("stem").and_then(Value::as_bool).unwrap_or(false);
+            options.paragraphs = a
+                .get("paragraphs")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             search(connection, required(&a, "query")?, &options)
         }
         "list_aasb_documents" => catalogue(
             connection,
             &options(&arguments(call, &["standard", "version"], &PAGING, &[])?)?,
         ),
-        "read_aasb_paragraph" => {
-            let a = arguments(call, &["document_sha256", "label"], &[], &[])?;
-            paragraph(
-                root,
-                connection,
-                required(&a, "document_sha256")?,
-                required(&a, "label")?,
-            )
-        }
+        "read_aasb_paragraph" => read_paragraph(root, connection, call),
         "verify_aasb_quote" => {
             let a = arguments(call, &["document_sha256", "quote"], &["page"], &[])?;
             let page = match a.get("page").and_then(Value::as_u64) {

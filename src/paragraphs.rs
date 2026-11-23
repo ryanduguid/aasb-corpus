@@ -254,10 +254,22 @@ fn fragments(selected: &[Line<'_>]) -> Vec<Value> {
     fragments
 }
 
-pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
+pub(crate) fn check_label(label: &str) -> Result<()> {
     if label.len() > 32 || !label.is_ascii() || !valid_label(label) {
         return Err("use an exact paragraph label such as 35, B19, Aus25.1 or BC1; request the parent paragraph for lettered subparagraphs".into());
     }
+    Ok(())
+}
+
+/// One anchored paragraph: its label, the physical page of its anchor and its candidate.
+pub(crate) struct Anchored {
+    pub label: String,
+    pub pdf_page: u32,
+    pub candidate: Value,
+}
+
+/// Every anchored paragraph of one PDF in reading order, delimited as `lookup` delimits it.
+pub(crate) fn index(pages: &[Page]) -> Vec<Anchored> {
     let lines = page_lines(pages);
     let anchors: Vec<_> = lines
         .iter()
@@ -265,26 +277,40 @@ pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
         .filter(|(_, line)| !line.skip)
         .filter_map(|(i, line)| label_at(line.text).map(|label| (i, label)))
         .collect();
-    let starts: Vec<_> = anchors
+    anchors
         .iter()
         .enumerate()
-        .filter(|(_, (_, found))| *found == label)
-        .collect();
-    let mut candidates = Vec::new();
-    for (position, (start, _)) in starts.iter().take(20) {
-        candidates.push(candidate(&lines, label, *start, anchors.get(position + 1)));
-    }
-    let status = match starts.len() {
+        .map(|(position, (start, label))| Anchored {
+            label: (*label).to_owned(),
+            pdf_page: lines[*start].page.page,
+            candidate: candidate(&lines, label, *start, anchors.get(position + 1)),
+        })
+        .collect()
+}
+
+/// The lookup result for `label` from every candidate in reading order.
+pub(crate) fn resolve(label: &str, candidates: Vec<Value>) -> Value {
+    let count = candidates.len();
+    let status = match count {
         0 => "not_found",
         1 if candidates[0]["needs_review"] == false => "found",
         1 => "needs_review",
         _ => "ambiguous",
     };
-    Ok(
-        json!({"paragraph":label,"status":status,"candidate_count":starts.len(),"candidates":candidates,
-        "candidates_truncated":starts.len() > 20,
-        "boundary":"Lookup uses extracted line anchors in the selected PDF, not a substring search or applicability decision. Repeated labels remain ambiguous. Read physical PDF pages for missing labels, layout or uncertain boundaries."}),
-    )
+    let candidates: Vec<_> = candidates.into_iter().take(20).collect();
+    json!({"paragraph":label,"status":status,"candidate_count":count,"candidates":candidates,
+    "candidates_truncated":count > 20,
+    "boundary":"Lookup uses extracted line anchors in the selected PDF, not a substring search or applicability decision. Repeated labels remain ambiguous. Read physical PDF pages for missing labels, layout or uncertain boundaries."})
+}
+
+pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
+    check_label(label)?;
+    let candidates = index(pages)
+        .into_iter()
+        .filter(|anchored| anchored.label == label)
+        .map(|anchored| anchored.candidate)
+        .collect();
+    Ok(resolve(label, candidates))
 }
 
 fn tokens(text: &str) -> Vec<String> {
