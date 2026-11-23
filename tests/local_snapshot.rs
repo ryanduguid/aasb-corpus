@@ -162,8 +162,9 @@ fn filters_pagination_and_paragraph_spans_on_the_local_snapshot() {
     );
 }
 
-/// Exact search always; stemmed search too when the index has the stem table.
-fn stem_modes(root: &str) -> &'static [bool] {
+/// Search modes as `(stemmed, paragraphs)`: exact page search always, stemmed search when the
+/// index has the stem table, and both paragraph searches when it has the paragraph table.
+fn search_modes(root: &str) -> Vec<(bool, bool)> {
     let index = rusqlite::Connection::open_with_flags(
         std::path::Path::new(root).join("index.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -172,11 +173,14 @@ fn stem_modes(root: &str) -> &'static [bool] {
     let version: i64 = index
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
+    let mut modes = vec![(false, false)];
     if version >= 2 {
-        &[false, true]
-    } else {
-        &[false]
+        modes.push((true, false));
     }
+    if version >= 3 {
+        modes.extend([(false, true), (true, true)]);
+    }
+    modes
 }
 
 fn fragment_pages(found: &Value) -> BTreeSet<u64> {
@@ -189,20 +193,36 @@ fn fragment_pages(found: &Value) -> BTreeSet<u64> {
         .collect()
 }
 
-/// Whether a search's first `limit` results include one of `pages` of document `sha`.
-fn ranked(root: &str, query: &str, sha: &str, pages: &BTreeSet<u64>, stem: bool) -> [bool; 2] {
+/// Whether a search of document `sha` has the expected paragraph in its first 5 and 20
+/// results: one of its `pages` for page search, its `label` for paragraph search.
+fn ranked(
+    root: &str,
+    query: &str,
+    sha: &str,
+    (pages, label): (&BTreeSet<u64>, &str),
+    (stem, paragraphs): (bool, bool),
+) -> [bool; 2] {
     let mut arguments = vec![query, "--version", sha, "--limit", "20"];
     if stem {
         arguments.push("--stem");
     }
+    if paragraphs {
+        arguments.push("--paragraphs");
+    }
     let found = call(root, "search", &arguments);
-    let hits: Vec<u64> = found["results"]
+    let hits: Vec<bool> = found["results"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|hit| hit["pdf_page"].as_u64().unwrap())
+        .map(|hit| {
+            if paragraphs {
+                hit["paragraph"] == label
+            } else {
+                pages.contains(&hit["pdf_page"].as_u64().unwrap())
+            }
+        })
         .collect();
-    [5, 20].map(|limit| hits.iter().take(limit).any(|page| pages.contains(page)))
+    [5, 20].map(|limit| hits.iter().take(limit).any(|hit| *hit))
 }
 
 /// Counts only: the fixture holds short queries and labels, and nothing prints page text.
@@ -210,11 +230,11 @@ fn ranked(root: &str, query: &str, sha: &str, pages: &BTreeSet<u64>, stem: bool)
 #[ignore = "requires AASB_TEST_SNAPSHOT pointing to a local captured index"]
 fn reference_questions_on_the_local_snapshot() {
     let root = std::env::var("AASB_TEST_SNAPSHOT").expect("set AASB_TEST_SNAPSHOT");
-    let modes = stem_modes(&root);
+    let modes = search_modes(&root);
     let questions = include_str!("fixtures/reference-questions.tsv");
     let mut statuses = std::collections::BTreeMap::<String, usize>::new();
     let mut located = 0;
-    let mut counts = [[0; 2]; 2];
+    let mut counts = vec![[0; 2]; modes.len()];
     for line in questions.lines().filter(|line| !line.starts_with('#')) {
         let [query, standard, label] = line.split('\t').collect::<Vec<_>>()[..] else {
             panic!("expected query, standard and paragraph: {line}");
@@ -229,31 +249,34 @@ fn reference_questions_on_the_local_snapshot() {
         for document in documents {
             let sha = document["document_sha256"].as_str().unwrap();
             let found = call(&root, "paragraph", &[sha, label]);
-            let status = found["status"].as_str().unwrap().to_owned();
+            *statuses
+                .entry(found["status"].as_str().unwrap().into())
+                .or_default() += 1;
             let pages = fragment_pages(&found);
-            *statuses.entry(status).or_default() += 1;
             if pages.is_empty() {
                 continue;
             }
             located += 1;
-            for (mode, stem) in modes.iter().enumerate() {
-                let hits = ranked(&root, query, sha, &pages, *stem);
+            for (mode, count) in modes.iter().zip(&mut counts) {
+                let hits = ranked(&root, query, sha, (&pages, label), *mode);
                 for (rank, hit) in hits.iter().enumerate() {
-                    counts[mode][rank] += usize::from(*hit);
+                    count[rank] += usize::from(*hit);
                 }
             }
         }
     }
     assert!(located > 0);
+    let total = questions.lines().filter(|l| !l.starts_with('#')).count();
     println!(
-        "reference questions: {} questions; {located} located paragraph versions; statuses={statuses:?}",
-        questions
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .count()
+        "reference questions: {total} questions; {located} located paragraph versions; statuses={statuses:?}"
     );
-    println!("exact: top5={} top20={}", counts[0][0], counts[0][1]);
-    if modes.len() == 2 {
-        println!("stemmed: top5={} top20={}", counts[1][0], counts[1][1]);
+    for ((stem, paragraphs), [top5, top20]) in modes.iter().zip(counts) {
+        let mode = match (stem, paragraphs) {
+            (false, false) => "exact",
+            (true, false) => "stemmed",
+            (false, true) => "paragraphs exact",
+            (true, true) => "paragraphs stemmed",
+        };
+        println!("{mode}: top5={top5} top20={top20}");
     }
 }

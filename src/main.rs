@@ -159,7 +159,15 @@ fn schema(connection: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE pages_fts USING fts5(text, content='pages', content_rowid='id');
         CREATE VIRTUAL TABLE pages_stem USING fts5(text, content='pages', content_rowid='id',
             tokenize='porter unicode61');
-        PRAGMA user_version=2;
+        CREATE TABLE paragraphs(id INTEGER PRIMARY KEY,
+            document_sha256 TEXT NOT NULL REFERENCES documents(sha256), ordinal INTEGER NOT NULL,
+            label TEXT NOT NULL, pdf_page INTEGER NOT NULL, needs_review INTEGER NOT NULL,
+            candidate TEXT NOT NULL, text TEXT NOT NULL, UNIQUE(document_sha256,ordinal));
+        CREATE INDEX paragraphs_label ON paragraphs(document_sha256,label);
+        CREATE VIRTUAL TABLE paragraphs_fts USING fts5(text, content='paragraphs', content_rowid='id');
+        CREATE VIRTUAL TABLE paragraphs_stem USING fts5(text, content='paragraphs', content_rowid='id',
+            tokenize='porter unicode61');
+        PRAGMA user_version=3;
     ")?;
     Ok(())
 }
@@ -217,7 +225,12 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
             .ok_or("missing or duplicate document identity")?;
         page_count += index_document(&transaction, root, &catalogue, document, &aliases)?;
     }
-    for table in ["pages_fts", "pages_stem"] {
+    for table in [
+        "pages_fts",
+        "pages_stem",
+        "paragraphs_fts",
+        "paragraphs_stem",
+    ] {
         transaction.execute(
             &format!("INSERT INTO {table}({table}) VALUES('rebuild')"),
             [],
@@ -254,7 +267,13 @@ fn group_sources<'a>(
     Ok(grouped)
 }
 
-fn insert_pages(connection: &Connection, document: &Document, page_path: &Path) -> Result<()> {
+/// Inserts the document's pages and returns them in page order.
+fn insert_pages(
+    connection: &Connection,
+    document: &Document,
+    page_path: &Path,
+) -> Result<Vec<Page>> {
+    let mut pages = Vec::new();
     let mut expected = 1;
     for line in BufReader::new(File::open(page_path)?).lines() {
         let page: Page = serde_json::from_str(&line?)?;
@@ -273,10 +292,39 @@ fn insert_pages(connection: &Connection, document: &Document, page_path: &Path) 
                 page.needs_review || page.text.trim().is_empty()
             ],
         )?;
+        pages.push(page);
         expected += 1;
     }
     if expected != document.page_count + 1 || file_hash(page_path)? != document.pages_sha256 {
         return Err("page coverage differs or extraction changed during indexing".into());
+    }
+    Ok(pages)
+}
+
+/// Stores every anchored paragraph with the candidate `paragraph` reports for it.
+fn insert_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Result<()> {
+    let mut statement = connection.prepare(
+        "INSERT INTO paragraphs(document_sha256,ordinal,label,pdf_page,needs_review,candidate,text)
+        VALUES (?1,?2,?3,?4,?5,?6,?7)",
+    )?;
+    for (ordinal, anchored) in paragraphs::index(pages).into_iter().enumerate() {
+        let candidate = &anchored.candidate;
+        let text = candidate["fragments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|fragment| fragment["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        statement.execute(params![
+            sha,
+            i64::try_from(ordinal)?,
+            anchored.label,
+            anchored.pdf_page,
+            candidate["needs_review"] == true,
+            candidate.to_string(),
+            text
+        ])?;
     }
     Ok(())
 }
@@ -315,7 +363,8 @@ fn index_document(
             document.pages_sha256
         ],
     )?;
-    insert_pages(connection, document, &page_path)?;
+    let pages = insert_pages(connection, document, &page_path)?;
+    insert_paragraphs(connection, &document.sha256, &pages)?;
     Ok(u64::from(document.page_count))
 }
 
@@ -326,8 +375,9 @@ fn schema_version(connection: &Connection) -> Result<i64> {
 fn open(root: &Path) -> Result<Connection> {
     let connection =
         Connection::open_with_flags(root.join("index.sqlite3"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    // Version 1 lacks only the stem table, so its indexes and their digests stay usable.
-    if !(1..=2).contains(&schema_version(&connection)?) {
+    // Version 1 lacks the stem table and version 2 the paragraph table; both stay usable,
+    // so citations keep their index digests.
+    if !(1..=3).contains(&schema_version(&connection)?) {
         return Err("unsupported corpus schema".into());
     }
     Ok(connection)
@@ -342,10 +392,14 @@ fn stats(connection: &Connection) -> Result<Value> {
             empty_pages += 1;
         }
     }
-    Ok(json!({"documents":count("SELECT count(*) FROM documents")?,
+    let mut result = json!({"documents":count("SELECT count(*) FROM documents")?,
         "pages":count("SELECT count(*) FROM pages")?,
         "review_pages":count("SELECT count(*) FROM pages WHERE needs_review=1")?,
-        "empty_pages":empty_pages}))
+        "empty_pages":empty_pages});
+    if schema_version(connection)? >= 3 {
+        result["paragraphs"] = json!(count("SELECT count(*) FROM paragraphs")?);
+    }
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -355,6 +409,7 @@ struct QueryOptions {
     limit: u32,
     offset: i64,
     stem: bool,
+    paragraphs: bool,
 }
 
 impl Default for QueryOptions {
@@ -365,6 +420,7 @@ impl Default for QueryOptions {
             limit: 20,
             offset: 0,
             stem: false,
+            paragraphs: false,
         }
     }
 }
@@ -486,7 +542,15 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     if stem && schema_version(connection)? < 2 {
         return Err("this index has no stem table; rebuild it as the README describes".into());
     }
-    let table = if stem { "pages_stem" } else { "pages_fts" };
+    if options.paragraphs {
+        require_paragraph_table(connection)?;
+    }
+    let unit = if options.paragraphs {
+        "paragraphs"
+    } else {
+        "pages"
+    };
+    let table = format!("{unit}_{}", if stem { "stem" } else { "fts" });
     let selected = if options.standard.is_some() || options.version.is_some() {
         let documents: Vec<_> = matching_documents(connection, options)?
             .into_iter()
@@ -496,13 +560,16 @@ fn search(connection: &Connection, query: &str, options: &QueryOptions) -> Resul
     } else {
         None
     };
-    let mut hits = search_hits(connection, table, query, selected.as_deref(), options)?;
+    let mut hits = search_hits(connection, &table, query, selected.as_deref(), options)?;
     let has_more = hits.len() > options.limit as usize;
     hits.truncate(options.limit as usize);
     let mut result = json!({"query":query,"results":hits,"limit":options.limit,"offset":options.offset,
         "filters":options.filters(),"has_more":has_more,
         "next_offset":has_more.then_some(options.offset + i64::from(options.limit)),
         "boundary":"Search covers captured versions; it does not determine reporting-period applicability."});
+    if options.paragraphs {
+        result["paragraphs"] = json!(true);
+    }
     if stem {
         result["stemmed"] = json!(true);
         result["stem_boundary"] = json!(
@@ -519,14 +586,25 @@ fn search_hits(
     selected: Option<&str>,
     options: &QueryOptions,
 ) -> Result<Vec<Value>> {
+    // Paragraph hits name their label and position; page hits their provenance.
+    let (content, page, detail, position) = if options.paragraphs {
+        (
+            "paragraphs",
+            "p.pdf_page",
+            "json_array(p.label,p.ordinal)",
+            "p.ordinal",
+        )
+    } else {
+        ("pages", "p.page", "p.provenance", "p.page")
+    };
     let mut statement = connection.prepare(&format!(
-        "SELECT p.document_sha256,p.page,
-        snippet({table},0,'[',']',' … ',40),p.provenance,p.needs_review,d.aliases,d.metadata
-        FROM {table} JOIN pages p ON p.id={table}.rowid
+        "SELECT p.document_sha256,{page},
+        snippet({table},0,'[',']',' … ',40),{detail},p.needs_review,d.aliases,d.metadata
+        FROM {table} JOIN {content} p ON p.id={table}.rowid
         JOIN documents d ON d.sha256=p.document_sha256
         WHERE {table} MATCH ?1
         AND (?2 IS NULL OR p.document_sha256 IN (SELECT value FROM json_each(?2)))
-        ORDER BY bm25({table}),p.document_sha256,p.page LIMIT ?3 OFFSET ?4"
+        ORDER BY bm25({table}),p.document_sha256,{position} LIMIT ?3 OFFSET ?4"
     ))?;
     let rows = statement.query_map(
         params![query, selected, options.limit + 1, options.offset],
@@ -544,10 +622,18 @@ fn search_hits(
     )?;
     let mut hits = Vec::new();
     for row in rows {
-        let (sha, page, snippet, provenance, needs_review, aliases, metadata) = row?;
-        hits.push(json!({"document_sha256":sha,"pdf_page":page,"snippet":snippet,
-            "provenance":provenance,"needs_review":needs_review,
-            "sources":serde_json::from_str::<Value>(&aliases)?,"version_metadata":serde_json::from_str::<Value>(&metadata)?}));
+        let (sha, page, snippet, detail, needs_review, aliases, metadata) = row?;
+        let mut hit = json!({"document_sha256":sha,"pdf_page":page,"snippet":snippet,
+            "needs_review":needs_review,
+            "sources":serde_json::from_str::<Value>(&aliases)?,"version_metadata":serde_json::from_str::<Value>(&metadata)?});
+        if options.paragraphs {
+            let detail: Value = serde_json::from_str(&detail)?;
+            hit["paragraph"] = detail[0].clone();
+            hit["ordinal"] = detail[1].clone();
+        } else {
+            hit["provenance"] = json!(detail);
+        }
+        hits.push(hit);
     }
     Ok(hits)
 }
@@ -646,10 +732,83 @@ fn aliases_metadata(connection: &Connection, sha: &str) -> Result<(String, Strin
     )?)
 }
 
-fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Result<Value> {
-    let (aliases, metadata) = aliases_metadata(connection, sha)?;
-    let mut statement = connection.prepare("SELECT page,text,provenance,needs_review FROM pages WHERE document_sha256=?1 ORDER BY page")?;
-    let pages: Vec<Page> = statement
+fn require_paragraph_table(connection: &Connection) -> Result<()> {
+    if schema_version(connection)? < 3 {
+        return Err("this index has no paragraph table; rebuild it as the README describes".into());
+    }
+    Ok(())
+}
+
+/// One PDF's stored paragraphs with ordinals in `range`, as `(ordinal, label, candidate)`.
+fn stored_paragraphs(
+    connection: &Connection,
+    sha: &str,
+    label: Option<&str>,
+    range: (i64, i64),
+) -> Result<Vec<(i64, String, Value)>> {
+    let mut statement = connection.prepare(
+        "SELECT ordinal,label,candidate FROM paragraphs WHERE document_sha256=?1
+        AND (?2 IS NULL OR label=?2) AND ordinal BETWEEN ?3 AND ?4 ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map(params![sha, label, range.0, range.1], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
+    })?;
+    let mut paragraphs = Vec::new();
+    for row in rows {
+        let (ordinal, label, candidate) = row?;
+        paragraphs.push((ordinal, label, serde_json::from_str(&candidate)?));
+    }
+    Ok(paragraphs)
+}
+
+/// Adds up to `context` stored neighbours on each side of every returned candidate.
+fn add_context(
+    connection: &Connection,
+    sha: &str,
+    result: &mut Value,
+    ordinals: &[i64],
+    context: i64,
+) -> Result<()> {
+    let candidates = result["candidates"]
+        .as_array_mut()
+        .ok_or("lookup has no candidates")?;
+    for (candidate, ordinal) in candidates.iter_mut().zip(ordinals) {
+        let mut sides = [Vec::new(), Vec::new()];
+        let range = (ordinal - context, ordinal + context);
+        for (neighbour, label, mut row) in stored_paragraphs(connection, sha, None, range)? {
+            if neighbour != *ordinal {
+                row["paragraph"] = json!(label);
+                row["ordinal"] = json!(neighbour);
+                sides[usize::from(neighbour > *ordinal)].push(row);
+            }
+        }
+        let [before, after] = sides;
+        candidate["context"] = json!({"ordinal":ordinal,"before":before,"after":after});
+    }
+    result["context_boundary"] = json!(
+        "Context paragraphs are stored neighbours in reading order. The second reader does not check them; look each one up to confirm it."
+    );
+    Ok(())
+}
+
+/// The candidates for `label` with their stored ordinals; an index without the paragraph
+/// table resolves them from its pages and has no ordinals.
+fn candidates(connection: &Connection, sha: &str, label: &str) -> Result<(Value, Vec<i64>)> {
+    if schema_version(connection)? >= 3 {
+        let stored = stored_paragraphs(connection, sha, Some(label), (0, i64::MAX))?;
+        let ordinals = stored.iter().map(|(ordinal, _, _)| *ordinal).collect();
+        let found = stored.into_iter().map(|(_, _, candidate)| candidate);
+        return Ok((paragraphs::resolve(label, found.collect()), ordinals));
+    }
+    let pages = document_pages(connection, sha)?;
+    Ok((paragraphs::lookup(&pages, label)?, Vec::new()))
+}
+
+fn document_pages(connection: &Connection, sha: &str) -> Result<Vec<Page>> {
+    let mut statement = connection.prepare(
+        "SELECT page,text,provenance,needs_review FROM pages WHERE document_sha256=?1 ORDER BY page",
+    )?;
+    let pages = statement
         .query_map([sha], |r| {
             Ok(Page {
                 page: r.get(0)?,
@@ -659,7 +818,27 @@ fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Re
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let mut result = paragraphs::lookup(&pages, label)?;
+    Ok(pages)
+}
+
+fn paragraph(
+    root: &Path,
+    connection: &Connection,
+    sha: &str,
+    label: &str,
+    context: Option<i64>,
+) -> Result<Value> {
+    let (aliases, metadata) = aliases_metadata(connection, sha)?;
+    paragraphs::check_label(label)?;
+    if context.is_some() {
+        require_paragraph_table(connection)?;
+    }
+    let page_count: u32 = connection.query_row(
+        "SELECT page_count FROM documents WHERE sha256=?1",
+        [sha],
+        |r| r.get(0),
+    )?;
+    let (mut result, ordinals) = candidates(connection, sha, label)?;
     let sources: Value = serde_json::from_str(&aliases)?;
     // A reading of replaced or removed source bytes cannot confirm the indexed text.
     let problems = if result["status"] == "found" {
@@ -668,7 +847,7 @@ fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Re
         Vec::new()
     };
     let reading = if result["status"] == "found" && problems.is_empty() {
-        second_reading(root, sha, pages.len())?
+        second_reading(root, sha, page_count as usize)?
     } else {
         None
     };
@@ -676,10 +855,34 @@ fn paragraph(root: &Path, connection: &Connection, sha: &str, label: &str) -> Re
     if !problems.is_empty() {
         result["second_reader"] = json!({"status":"source_changed","reasons":problems});
     }
+    if let Some(context) = context {
+        add_context(connection, sha, &mut result, &ordinals, context)?;
+    }
     result["document_sha256"] = json!(sha);
     result["sources"] = sources;
     result["version_metadata"] = serde_json::from_str(&metadata)?;
     Ok(result)
+}
+
+/// Removes a flag that takes no value; reports whether it was present.
+fn take_flag(arguments: &mut Vec<String>, flag: &str) -> bool {
+    let position = arguments.iter().position(|argument| argument == flag);
+    if let Some(position) = position {
+        arguments.remove(position);
+    }
+    position.is_some()
+}
+
+/// Parses the paragraph `--context` count: 1 to 5 neighbours on each side.
+fn context_count(arguments: &[String]) -> Result<Option<i64>> {
+    match arguments {
+        [] => Ok(None),
+        [option, count] if option == "--context" => match count.parse() {
+            Ok(count @ 1..=5) => Ok(Some(count)),
+            _ => Err("context must be 1 to 5 paragraphs".into()),
+        },
+        _ => Err("invalid paragraph option; use --context N".into()),
+    }
 }
 
 fn page(connection: &Connection, sha: &str, number: u32) -> Result<Value> {
@@ -814,6 +1017,28 @@ fn verify_quote(
     Ok(result)
 }
 
+/// The stored paragraphs must be exactly those the indexed pages yield today.
+fn check_paragraphs(connection: &Connection, sha: &str) -> Result<()> {
+    let expected: Vec<_> = paragraphs::index(&document_pages(connection, sha)?)
+        .into_iter()
+        .map(|a| (a.label, a.pdf_page, a.candidate))
+        .collect();
+    let mut statement = connection.prepare(
+        "SELECT label,pdf_page,candidate FROM paragraphs WHERE document_sha256=?1 ORDER BY ordinal",
+    )?;
+    let mut stored = Vec::new();
+    for row in statement.query_map([sha], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
+    })? {
+        let (label, page, candidate) = row?;
+        stored.push((label, page, serde_json::from_str::<Value>(&candidate)?));
+    }
+    if stored != expected {
+        return Err("paragraph table differs from the indexed pages; rebuild the index".into());
+    }
+    Ok(())
+}
+
 fn verify(root: &Path, connection: &Connection) -> Result<Value> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -846,6 +1071,9 @@ fn verify(root: &Path, connection: &Connection) -> Result<Value> {
         )?;
         if actual != expected {
             return Err("indexed page count differs".into());
+        }
+        if schema_version(connection)? >= 3 {
+            check_paragraphs(connection, &sha)?;
         }
     }
     let mut statement = connection.prepare("SELECT text,text_sha256 FROM pages")?;
@@ -880,18 +1108,21 @@ fn run() -> Result<Value> {
         "stats" if arguments.len() == 2 => stats(&connection),
         "catalogue" => catalogue(&connection, &QueryOptions::parse(&arguments[2..])?),
         "search" if arguments.len() >= 3 => {
-            let mut options = arguments[3..].to_vec();
-            let stem = options.iter().position(|option| option == "--stem");
-            if let Some(position) = stem {
-                options.remove(position);
-            }
-            let mut options = QueryOptions::parse(&options)?;
-            options.stem = stem.is_some();
+            let mut words = arguments[3..].to_vec();
+            let stem = take_flag(&mut words, "--stem");
+            let paragraphs = take_flag(&mut words, "--paragraphs");
+            let mut options = QueryOptions::parse(&words)?;
+            options.stem = stem;
+            options.paragraphs = paragraphs;
             search(&connection, &arguments[2], &options)
         }
-        "paragraph" if arguments.len() == 4 => {
-            paragraph(root, &connection, &arguments[2], &arguments[3])
-        }
+        "paragraph" if arguments.len() >= 4 => paragraph(
+            root,
+            &connection,
+            &arguments[2],
+            &arguments[3],
+            context_count(&arguments[4..])?,
+        ),
         "page" if arguments.len() == 4 => page(&connection, &arguments[2], arguments[3].parse()?),
         "verify" if arguments.len() == 2 => verify(root, &connection),
         "verify-quote" if arguments.len() == 4 => {
@@ -995,6 +1226,22 @@ mod tests {
         );
         assert!(build(&root).is_err());
         fs::write(root.join("source/sample.pdf"), b"Changed source").unwrap();
+        assert!(verify(&root, &connection).is_err());
+    }
+    #[test]
+    fn verify_refuses_a_paragraph_table_that_differs_from_the_pages() {
+        let root = fixture();
+        build(&root).unwrap();
+        let connection = Connection::open(root.join("index.sqlite3")).unwrap();
+        assert_eq!(verify(&root, &connection).unwrap()["verified"], true);
+        // The fixture page has no paragraph anchor, so any stored row is stale.
+        connection
+            .execute(
+                "INSERT INTO paragraphs(document_sha256,ordinal,label,pdf_page,needs_review,candidate,text)
+                SELECT sha256,0,'1',1,0,'{}','' FROM documents",
+                [],
+            )
+            .unwrap();
         assert!(verify(&root, &connection).is_err());
     }
     #[test]
@@ -1202,13 +1449,31 @@ mod tests {
             .unwrap();
         connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,1,?2,?3,'native',0)",
             params![sha, text, hash(text.as_bytes())]).unwrap();
+        store_paragraphs(&connection);
         (root, connection, sha)
+    }
+    fn lookup_35(root: &Path, connection: &Connection, sha: &str) -> Result<Value> {
+        paragraph(root, connection, sha, "35", None)
+    }
+    /// Stores the paragraphs of the pages inserted so far, as `build` does.
+    fn store_paragraphs(connection: &Connection) {
+        connection.execute("DELETE FROM paragraphs", []).unwrap();
+        let mut statement = connection.prepare("SELECT sha256 FROM documents").unwrap();
+        let documents: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        for sha in documents {
+            let pages = document_pages(connection, &sha).unwrap();
+            insert_paragraphs(connection, &sha, &pages).unwrap();
+        }
     }
     #[test]
     fn paragraph_lookup_requires_an_unchanged_second_reading() {
         let (root, connection, sha) = paragraph_fixture();
         let source_manifest = root.join("source/manifest.json");
-        let status = || paragraph(&root, &connection, &sha, "35").map(|r| r["status"].clone());
+        let status = || lookup_35(&root, &connection, &sha).map(|r| r["status"].clone());
         assert_eq!(status().unwrap(), "found_unconfirmed");
         let folder = root.join("second-reader");
         fs::create_dir_all(folder.join(&sha)).unwrap();
@@ -1271,8 +1536,9 @@ mod tests {
         let second = "--\n36 Next requirement.";
         connection.execute("INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review) VALUES(?1,2,?2,?3,'native',0)",
             params![sha, second, hash(second.as_bytes())]).unwrap();
+        store_paragraphs(&connection);
         fs::write(root.join("source/sample.pdf"), b"Replaced fabricated bytes").unwrap();
-        let result = paragraph(&root, &connection, &sha, "35").unwrap();
+        let result = paragraph(&root, &connection, &sha, "35", None).unwrap();
         assert_eq!(result["candidates"][0]["fragments"][1]["text"], "--");
         assert_eq!(result["status"], "needs_review");
         assert_eq!(result["second_reader"]["status"], "source_changed");
@@ -1293,7 +1559,7 @@ mod tests {
             "documents":[{"sha256":sha,"page_count":1,"pages_sha256":hash(pages.as_bytes())}],
             "failures":[]});
         fs::write(folder.join("manifest.json"), manifest.to_string()).unwrap();
-        let lookup = || paragraph(&root, &connection, &sha, "35").unwrap();
+        let lookup = || paragraph(&root, &connection, &sha, "35", None).unwrap();
         assert_eq!(lookup()["status"], "found");
         let source = root.join("source/sample.pdf");
         fs::write(&source, b"Replaced fabricated bytes").unwrap();
@@ -1421,8 +1687,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(catalogue(&connection, &options).unwrap()["next_offset"], 2);
+        store_paragraphs(&connection);
         assert_eq!(
-            paragraph(Path::new("absent"), &connection, &"b".repeat(64), "35").unwrap()["status"],
+            paragraph(
+                Path::new("absent"),
+                &connection,
+                &"b".repeat(64),
+                "35",
+                None
+            )
+            .unwrap()["status"],
             "ambiguous"
         );
     }
