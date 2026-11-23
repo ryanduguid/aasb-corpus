@@ -315,14 +315,14 @@ fn insert_pages(
     Ok(pages)
 }
 
-/// Stores every anchored paragraph with the candidate `paragraph` reports for it.
-fn insert_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Result<()> {
-    let mut statement = connection.prepare(
-        "INSERT INTO paragraphs(document_sha256,ordinal,label,pdf_page,needs_review,candidate,text)
-        VALUES (?1,?2,?3,?4,?5,?6,?7)",
-    )?;
+/// One stored paragraph: ordinal, label, anchor page, review flag, candidate and search text.
+type ParagraphRow = (i64, String, u32, bool, Value, String);
+
+/// Every anchored paragraph of one PDF as `build` stores it and `verify` re-derives it.
+fn paragraph_rows(pages: &[Page]) -> Result<Vec<ParagraphRow>> {
+    let mut rows = Vec::new();
     for (ordinal, anchored) in paragraphs::index(pages).into_iter().enumerate() {
-        let candidate = &anchored.candidate;
+        let candidate = anchored.candidate;
         let text = candidate["fragments"]
             .as_array()
             .into_iter()
@@ -330,12 +330,32 @@ fn insert_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Resu
             .filter_map(|fragment| fragment["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        statement.execute(params![
-            sha,
+        let review = candidate["needs_review"] == true;
+        rows.push((
             i64::try_from(ordinal)?,
             anchored.label,
             anchored.pdf_page,
-            candidate["needs_review"] == true,
+            review,
+            candidate,
+            text,
+        ));
+    }
+    Ok(rows)
+}
+
+/// Stores every anchored paragraph with the candidate `paragraph` reports for it.
+fn insert_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Result<()> {
+    let mut statement = connection.prepare(
+        "INSERT INTO paragraphs(document_sha256,ordinal,label,pdf_page,needs_review,candidate,text)
+        VALUES (?1,?2,?3,?4,?5,?6,?7)",
+    )?;
+    for (ordinal, label, page, review, candidate, text) in paragraph_rows(pages)? {
+        statement.execute(params![
+            sha,
+            ordinal,
+            label,
+            page,
+            review,
             candidate.to_string(),
             text
         ])?;
@@ -395,18 +415,30 @@ fn insert_citations(
         "INSERT INTO citations(citing_document_sha256,pdf_page,line,cited_standard,cited_label,kind)
         VALUES (?1,?2,?3,?4,?5,?6)",
     )?;
-    let kind = derived::kind(metadata);
-    for citation in derived::citations(pages) {
-        statement.execute(params![
-            sha,
-            citation.pdf_page,
-            i64::try_from(citation.line)?,
-            standard_key(&citation.standard),
-            citation.label,
-            kind
-        ])?;
+    for (page, line, standard, label, kind) in citation_rows(metadata, pages)? {
+        statement.execute(params![sha, page, line, standard, label, kind])?;
     }
     Ok(())
+}
+
+/// One stored citation: page, line, cited standard key, cited label and citing kind.
+type CitationRow = (u32, i64, String, String, String);
+
+/// Each paragraph the document's pages cite, as `build` stores it and `verify` re-derives it.
+fn citation_rows(metadata: &[Value], pages: &[Page]) -> Result<Vec<CitationRow>> {
+    let kind = derived::kind(metadata);
+    derived::citations(pages)
+        .into_iter()
+        .map(|citation| {
+            Ok((
+                citation.pdf_page,
+                i64::try_from(citation.line)?,
+                standard_key(&citation.standard),
+                citation.label,
+                kind.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 /// The principal standards a document's catalogue rows name, as `standard_key`s.
@@ -418,10 +450,11 @@ fn standard_keys(metadata: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// Stores each document's validity and reporting tier. A version is superseded by the
-/// versions of the same standard whose stated periods begin on its stated end date.
-fn insert_facts(connection: &Connection, catalogue: &Value) -> Result<()> {
-    let mut statement = connection.prepare("SELECT sha256,metadata FROM documents")?;
+/// Each document's validity and reporting tier, in hash order. A version is superseded by
+/// the versions of the same standard whose stated periods begin on its stated end date.
+fn derive_facts(connection: &Connection, catalogue: &Value) -> Result<Vec<(String, Value, Value)>> {
+    let mut statement =
+        connection.prepare("SELECT sha256,metadata FROM documents ORDER BY sha256")?;
     let mut facts = Vec::new();
     for row in statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
         let (sha, metadata) = row?;
@@ -448,7 +481,15 @@ fn insert_facts(connection: &Connection, catalogue: &Value) -> Result<()> {
         let successors = json!(successors);
         facts[index].2["superseded_by"] = successors;
     }
-    for (sha, _, validity, tier) in facts {
+    Ok(facts
+        .into_iter()
+        .map(|(sha, _, validity, tier)| (sha, validity, tier))
+        .collect())
+}
+
+/// Stores each document's validity and reporting tier.
+fn insert_facts(connection: &Connection, catalogue: &Value) -> Result<()> {
+    for (sha, validity, tier) in derive_facts(connection, catalogue)? {
         connection.execute(
             "INSERT INTO document_facts VALUES (?1,?2,?3)",
             params![sha, validity.to_string(), tier.to_string()],
@@ -937,6 +978,7 @@ fn add_context(
     ordinals: &[i64],
     context: i64,
 ) -> Result<()> {
+    let label = result["paragraph"].as_str().unwrap_or_default().to_owned();
     let candidates = result["candidates"]
         .as_array_mut()
         .ok_or("lookup has no candidates")?;
@@ -950,11 +992,34 @@ fn add_context(
                 sides[usize::from(neighbour > *ordinal)].push(row);
             }
         }
-        let [before, after] = sides;
+        let [mut before, mut after] = sides;
+        before.reverse();
+        // Each side stops where the label series changes or restarts.
+        let series = |side: Vec<Value>, forward: bool| {
+            let mut previous = label.clone();
+            let mut kept: Vec<Value> = side
+                .into_iter()
+                .take_while(|row| {
+                    let next = row["paragraph"].as_str().unwrap_or_default();
+                    let continues = if forward {
+                        paragraphs::same_series(&previous, next)
+                    } else {
+                        paragraphs::same_series(next, &previous)
+                    };
+                    previous = next.to_owned();
+                    continues
+                })
+                .collect();
+            if !forward {
+                kept.reverse();
+            }
+            kept
+        };
+        (before, after) = (series(before, false), series(after, true));
         candidate["context"] = json!({"ordinal":ordinal,"before":before,"after":after});
     }
     result["context_boundary"] = json!(
-        "Context paragraphs are stored neighbours in reading order. The second reader does not check them; look each one up to confirm it."
+        "Context paragraphs are stored neighbours in reading order, stopping where the label series changes or restarts, such as at an appendix, a copyright notice or reproduced text. The second reader does not check them; look each one up to confirm it."
     );
     Ok(())
 }
@@ -1193,23 +1258,93 @@ fn verify_quote(
 }
 
 /// The stored paragraphs must be exactly those the indexed pages yield today.
-fn check_paragraphs(connection: &Connection, sha: &str) -> Result<()> {
-    let expected: Vec<_> = paragraphs::index(&document_pages(connection, sha)?)
-        .into_iter()
-        .map(|a| (a.label, a.pdf_page, a.candidate))
-        .collect();
+fn check_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Result<()> {
     let mut statement = connection.prepare(
-        "SELECT label,pdf_page,candidate FROM paragraphs WHERE document_sha256=?1 ORDER BY ordinal",
+        "SELECT ordinal,label,pdf_page,needs_review,candidate,text FROM paragraphs
+        WHERE document_sha256=?1 ORDER BY ordinal",
     )?;
     let mut stored = Vec::new();
     for row in statement.query_map([sha], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get::<_, String>(4)?,
+            r.get(5)?,
+        ))
     })? {
-        let (label, page, candidate) = row?;
-        stored.push((label, page, serde_json::from_str::<Value>(&candidate)?));
+        let (ordinal, label, page, review, candidate, text) = row?;
+        stored.push((
+            ordinal,
+            label,
+            page,
+            review,
+            serde_json::from_str(&candidate)?,
+            text,
+        ));
     }
-    if stored != expected {
+    if stored != paragraph_rows(pages)? {
         return Err("paragraph table differs from the indexed pages; rebuild the index".into());
+    }
+    Ok(())
+}
+
+const DERIVED_DIFFERS: &str = "derived facts differ from the snapshot's sources; rebuild the index";
+
+/// Every stored paragraph (schema 3), citation and document fact (schema 4) must be what
+/// the indexed pages, the stored catalogue rows and `catalogue.json` yield today.
+fn check_derived(root: &Path, connection: &Connection) -> Result<()> {
+    let schema = schema_version(connection)?;
+    let documents: Vec<(String, String)> = connection
+        .prepare("SELECT sha256,metadata FROM documents")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (sha, metadata) in documents {
+        let pages = document_pages(connection, &sha)?;
+        check_paragraphs(connection, &sha, &pages)?;
+        if schema >= 4 {
+            let metadata: Vec<Value> = serde_json::from_str(&metadata)?;
+            let stored = connection
+                .prepare_cached(
+                    "SELECT pdf_page,line,cited_standard,cited_label,kind FROM citations
+                    WHERE citing_document_sha256=?1 ORDER BY id",
+                )?
+                .query_map([&sha], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<std::result::Result<Vec<CitationRow>, _>>()?;
+            if stored != citation_rows(&metadata, &pages)? {
+                return Err(DERIVED_DIFFERS.into());
+            }
+        }
+    }
+    if schema >= 4 {
+        check_facts(root, connection)?;
+    }
+    Ok(())
+}
+
+fn check_facts(root: &Path, connection: &Connection) -> Result<()> {
+    let catalogue: Value = read_json(&root.join("catalogue.json"))?;
+    let mut statement = connection.prepare(
+        "SELECT document_sha256,validity,reporting_tier FROM document_facts
+        ORDER BY document_sha256",
+    )?;
+    let mut stored = Vec::new();
+    for row in statement.query_map([], |r| {
+        Ok((r.get(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })? {
+        let (sha, validity, tier): (String, String, String) = row?;
+        let facts = (
+            sha,
+            serde_json::from_str(&validity)?,
+            serde_json::from_str(&tier)?,
+        );
+        stored.push(facts);
+    }
+    if stored != derive_facts(connection, &catalogue)? {
+        return Err(DERIVED_DIFFERS.into());
     }
     Ok(())
 }
@@ -1247,9 +1382,9 @@ fn verify(root: &Path, connection: &Connection) -> Result<Value> {
         if actual != expected {
             return Err("indexed page count differs".into());
         }
-        if schema_version(connection)? >= 3 {
-            check_paragraphs(connection, &sha)?;
-        }
+    }
+    if schema_version(connection)? >= 3 {
+        check_derived(root, connection)?;
     }
     let mut statement = connection.prepare("SELECT text,text_sha256 FROM pages")?;
     for row in statement.query_map([], |row| {
