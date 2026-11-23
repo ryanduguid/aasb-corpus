@@ -739,15 +739,19 @@ fn an_older_index_answers_paragraphs_from_pages_and_refuses_the_table_options() 
     fixture.call("build", &[]);
     let sha = hash(&source("sequence"));
     let repeat = hash(&source("repeat"));
-    let current = [
-        fixture.call("paragraph", &[&sha, "26"]),
-        fixture.call("paragraph", &[&repeat, "6"]),
-    ];
+    // Schema 2 has no derived facts, so compare the lookup without them.
+    let current = [(&sha, "26"), (&repeat, "6")].map(|(document, label)| {
+        let mut result = fixture.call("paragraph", &[document, label]);
+        for key in ["cited_by", "validity", "reporting_tier", "derived_boundary"] {
+            result.as_object_mut().unwrap().remove(key).unwrap();
+        }
+        result
+    });
     let connection = rusqlite::Connection::open(fixture.0.join("index.sqlite3")).unwrap();
     connection
         .execute_batch(
             "DROP TABLE paragraphs_fts; DROP TABLE paragraphs_stem; DROP TABLE paragraphs;
-            PRAGMA user_version=2;",
+            DROP TABLE citations; DROP TABLE document_facts; PRAGMA user_version=2;",
         )
         .unwrap();
     drop(connection);
@@ -787,4 +791,113 @@ fn mcp_paragraph_context_and_search_match_the_commands() {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(reply["result"]["structuredContent"], command);
     }
+}
+
+const CITING_DOCUMENTS: [(&str, &str, &str, &str); 4] = [
+    (
+        "leases-old",
+        "AASB 16",
+        "Fabricated older",
+        "26 Fabricated amber lease requirement.\n27 Next fabricated paragraph.",
+    ),
+    (
+        "leases-new",
+        "AASB 16",
+        "Fabricated newer",
+        "26 Fabricated amber lease requirement.\n27 Next fabricated paragraph.",
+    ),
+    (
+        "tier",
+        "AASB 1060",
+        "Fabricated tier",
+        "1 Fabricated note; see paragraph 26 of AASB 16.\n2 Next fabricated note.",
+    ),
+    (
+        "amending",
+        "",
+        "",
+        "5 Paragraphs 26 and 27 of AASB 16 are fabricated.\n6 Next fabricated amendment.",
+    ),
+];
+
+/// A catalogue that states periods, a tier title and an amending standard, as the
+/// captured catalogue does.
+fn citing_fixture() -> Fixture {
+    let fixture = Fixture::with(&CITING_DOCUMENTS);
+    let url = |name: &str| format!("https://example.invalid/{name}.pdf");
+    write_json(
+        &fixture.0.join("catalogue.json"),
+        json!({"retrieved_date":"2026-10-15",
+        "listings":[{"standard":"AASB 1060","title":"Fabricated Simplified Disclosures for Tier 2 Entities"}],
+        "versions":[
+            {"standard":"AASB 16","version_label":"Fabricated older","download_url":url("leases-old"),
+             "applies_to_periods_text":"Applies to periods beginning on or after 1 January 2019 but before 1 January 2027"},
+            {"standard":"AASB 16","version_label":"Fabricated newer","download_url":url("leases-new"),
+             "applies_to_periods_text":"Applies to periods beginning on or after 1 January 2027"},
+            {"standard":"AASB 1060","version_label":"Fabricated tier","download_url":url("tier")}],
+        "amendments":[{"title":"AASB 2099-1 Amendments to Australian Accounting Standards – Fabricated",
+            "download_url":url("amending"),"parent_standards":["AASB 16"]}]}),
+    );
+    fixture.call("build", &[]);
+    fixture
+}
+
+fn citing_titles(cited_by: &Value, kind: &str) -> Vec<(String, u64)> {
+    cited_by[kind]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["title"].as_str().unwrap().to_owned(),
+                row["line"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn paragraphs_carry_their_citations_validity_and_stated_tier() {
+    let fixture = citing_fixture();
+    let old = hash(&source("leases-old"));
+    let new = hash(&source("leases-new"));
+    let found = fixture.call("paragraph", &[&old, "26"]);
+    let cited_by = &found["cited_by"];
+    assert_eq!(
+        citing_titles(cited_by, "standards"),
+        [("Fabricated tier".into(), 1)]
+    );
+    assert_eq!(
+        citing_titles(cited_by, "amending_standards"),
+        [(
+            "AASB 2099-1 Amendments to Australian Accounting Standards – Fabricated".into(),
+            1
+        )]
+    );
+    // The snapshot holds no Interpretation or agenda decision, so none is linked.
+    assert_eq!(cited_by["interpretations"], json!([]));
+    assert_eq!(cited_by["agenda_decisions"], json!([]));
+    assert_eq!(cited_by["total"], 2);
+    assert_eq!(found["validity"]["status"], "current");
+    assert_eq!(found["validity"]["superseded_by"], json!([new]));
+    assert_eq!(found["reporting_tier"]["tier"], Value::Null);
+    assert!(
+        found["derived_boundary"]
+            .as_str()
+            .unwrap()
+            .contains("does not decide")
+    );
+    let later = fixture.call("paragraph", &[&new, "27"]);
+    assert_eq!(later["validity"]["status"], "not_yet_effective");
+    assert_eq!(later["validity"]["superseded_by"], json!([]));
+    assert_eq!(later["cited_by"]["total"], 1);
+    let tier = fixture.call("paragraph", &[&hash(&source("tier")), "1"]);
+    assert_eq!(tier["reporting_tier"]["tier"], 2);
+    assert_eq!(tier["validity"]["status"], Value::Null);
+    let catalogue = fixture.call("catalogue", &["--version", &old]);
+    assert_eq!(catalogue["results"][0]["validity"], found["validity"]);
+    assert_eq!(
+        catalogue["results"][0]["reporting_tier"],
+        found["reporting_tier"]
+    );
 }
