@@ -65,14 +65,21 @@ fn check_fragment(root: &str, sha: &str, fragment: &Value, found: bool) {
     let text = page["text"].as_str().unwrap();
     let start = fragment["start_line"].as_u64().unwrap() as usize - 1;
     let end = fragment["end_line"].as_u64().unwrap() as usize;
-    assert_eq!(
-        fragment["text"],
-        text.lines()
-            .skip(start)
-            .take(end - start)
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    let mut lines: Vec<String> = text
+        .lines()
+        .skip(start)
+        .take(end - start)
+        .map(str::to_owned)
+        .collect();
+    // A split line is cut at one-based character columns: the end first, then the start.
+    if let Some(column) = fragment["end_column"].as_u64() {
+        let last = lines.last_mut().unwrap();
+        *last = last.chars().take(column as usize).collect();
+    }
+    if let Some(column) = fragment["start_column"].as_u64() {
+        lines[0] = lines[0].chars().skip(column as usize - 1).collect();
+    }
+    assert_eq!(fragment["text"], lines.join("\n"));
     if found {
         let line = fragment["text"].as_str().unwrap().lines().next().unwrap();
         let pdf_page = fragment["pdf_page"].to_string();

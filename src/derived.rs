@@ -194,10 +194,20 @@ struct Periods {
 /// Reads the mandatory periods; an early-application sentence is optional and not read.
 fn periods(text: &str) -> Periods {
     let text = text.split("Early application").next().unwrap_or_default();
+    // 'but before' bounds whichever clause it follows: period beginnings or period ends.
+    let ends_clause = text.find("but before ").is_some_and(|at| {
+        text[..at].rfind("end on or after ") > text[..at].rfind("beginning on or after ")
+    });
+    let but_before = date_after(text, "but before ");
+    let (but_before, ends_but_before) = if ends_clause {
+        (None, but_before)
+    } else {
+        (but_before, None)
+    };
     let found = Periods {
         from: date_after(text, "beginning on or after "),
-        before: date_after(text, "but before ").or_else(|| date_after(text, "beginning before ")),
-        ends_before: date_after(text, "end before "),
+        before: but_before.or_else(|| date_after(text, "beginning before ")),
+        ends_before: ends_but_before.or_else(|| date_after(text, "end before ")),
         ends_from: date_after(text, "end on or after "),
         complete: false,
     };
@@ -398,6 +408,23 @@ mod tests {
         assert_eq!(amendment["applies_from"], "2025-07-01");
         assert_eq!(amendment["status"], "current");
         assert_eq!(amendment["periods_ending_on_or_after"], "2026-02-28");
+    }
+
+    #[test]
+    fn but_before_bounds_the_clause_it_follows() {
+        // After an end-date clause it bounds period ends, not beginnings.
+        let ends = status(Some(
+            "Applies to periods beginning on or after 1 January 2023 that end on or after 30 June 2023 but before 30 September 2023",
+        ));
+        assert_eq!(ends["applies_before"], Value::Null);
+        assert_eq!(ends["periods_ending_on_or_after"], "2023-06-30");
+        assert_eq!(ends["periods_ending_before"], "2023-09-30");
+        assert_eq!(ends["status"], "superseded");
+        let both = status(Some(
+            "Applies to periods beginning on or after 1 July 2021 but before 1 January 2022 that end before 30 June 2022",
+        ));
+        assert_eq!(both["applies_before"], "2022-01-01");
+        assert_eq!(both["periods_ending_before"], "2022-06-30");
     }
 
     #[test]

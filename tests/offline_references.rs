@@ -689,7 +689,8 @@ fn a_repeated_label_keeps_one_context_per_candidate_and_counts_are_bounded() {
     let candidates = ambiguous["candidates"].as_array().unwrap();
     assert!(context_labels(&candidates[0], "before").is_empty());
     assert_eq!(context_labels(&candidates[0], "after"), ["6"]);
-    assert_eq!(context_labels(&candidates[1], "before"), ["6"]);
+    // The second 5 restarts the series, so the first 6 is not its context.
+    assert!(context_labels(&candidates[1], "before").is_empty());
     assert_eq!(context_labels(&candidates[1], "after"), ["6"]);
     let root = fixture.0.to_str().unwrap();
     for bad in ["0", "6", "x"] {
@@ -922,4 +923,58 @@ fn reference_questions_are_well_formed_and_cover_aasb_s2() {
         .map(|row| row[2])
         .collect();
     assert_eq!(s2, BTreeSet::from(["3", "AusC1.1", "BC88"]));
+}
+
+const SERIES_DOCUMENTS: [(&str, &str, &str, &str); 1] = [(
+    "series",
+    "AASB S2",
+    "Fabricated series",
+    "104 Fabricated main paragraph.\n105 Fabricated last main paragraph.\nB1 Fabricated appendix paragraph.\nB2 Fabricated second appendix paragraph.\nC5 Fabricated transition paragraph.\nC6 Fabricated last transition paragraph.\nC1 Fabricated reproduced paragraph.\nC2 Fabricated reproduced second paragraph.",
+)];
+
+#[test]
+fn context_stops_where_the_label_series_changes_or_restarts() {
+    let fixture = Fixture::with(&SERIES_DOCUMENTS);
+    fixture.call("build", &[]);
+    let sha = hash(&source("series"));
+    let appendix = fixture.call("paragraph", &[&sha, "B1", "--context", "3"]);
+    let candidate = &appendix["candidates"][0];
+    assert!(context_labels(candidate, "before").is_empty());
+    assert_eq!(context_labels(candidate, "after"), ["B2"]);
+    let last = fixture.call("paragraph", &[&sha, "C6", "--context", "3"]);
+    assert_eq!(context_labels(&last["candidates"][0], "before"), ["C5"]);
+    assert!(context_labels(&last["candidates"][0], "after").is_empty());
+    let main = fixture.call("paragraph", &[&sha, "105", "--context", "2"]);
+    assert_eq!(context_labels(&main["candidates"][0], "before"), ["104"]);
+    assert!(context_labels(&main["candidates"][0], "after").is_empty());
+}
+
+/// Each stored row `verify` must re-derive: a change to any of them fails verification.
+#[test]
+fn verify_rederives_paragraph_columns_citations_and_document_facts() {
+    let fixture = citing_fixture();
+    let root = fixture.0.to_str().unwrap();
+    assert_eq!(fixture.call("verify", &[])["verified"], true);
+    for change in [
+        "UPDATE paragraphs SET text='altered' WHERE id=(SELECT min(id) FROM paragraphs)",
+        "UPDATE paragraphs SET needs_review=1-needs_review WHERE id=(SELECT min(id) FROM paragraphs)",
+        "UPDATE paragraphs SET ordinal=ordinal+100 WHERE id=(SELECT max(id) FROM paragraphs)",
+        "UPDATE citations SET cited_label='99' WHERE id=(SELECT min(id) FROM citations)",
+        "DELETE FROM citations WHERE id=(SELECT min(id) FROM citations)",
+        "UPDATE document_facts SET validity=replace(validity,'current','superseded')",
+        "UPDATE document_facts SET reporting_tier='{\"tier\":3,\"basis\":null}'",
+    ] {
+        let path = fixture.0.join("index.sqlite3");
+        let original = fs::read(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        assert!(connection.execute(change, []).unwrap() > 0, "{change}");
+        drop(connection);
+        let verified = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))
+            .args(["verify", root])
+            .output()
+            .unwrap();
+        assert!(!verified.status.success(), "{change}");
+        fs::write(&path, original).unwrap();
+    }
+    assert_eq!(fixture.call("verify", &[])["verified"], true);
 }

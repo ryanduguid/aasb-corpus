@@ -82,22 +82,38 @@ fn heading(line: &str) -> bool {
             && !plain.ends_with(['.', ':', ';', ')', ']']))
 }
 
+/// A label's letter prefix (without `Aus`) and its dotted numbers with any letter suffix.
+type Parts = (String, Vec<(u32, Option<u8>)>);
+
+fn parts(value: &str) -> Option<Parts> {
+    let value = value.strip_prefix("Aus").unwrap_or(value);
+    let prefix = value.bytes().take_while(u8::is_ascii_uppercase).count();
+    let numbers: Option<Vec<_>> = value[prefix..]
+        .split('.')
+        .map(|part| {
+            let digits = part.trim_end_matches(|c: char| c.is_ascii_uppercase());
+            Some((
+                digits.parse::<u32>().ok()?,
+                part.bytes().last().filter(u8::is_ascii_uppercase),
+            ))
+        })
+        .collect();
+    Some((value[..prefix].to_owned(), numbers?))
+}
+
+/// True when `later` can continue the series `earlier` belongs to: the same letter prefix
+/// and a leading number that does not go back. A change or restart marks another part of
+/// the PDF, such as an appendix or reproduced text.
+pub(crate) fn same_series(earlier: &str, later: &str) -> bool {
+    match (parts(earlier), parts(later)) {
+        (Some((prefix, first)), Some((next_prefix, next))) => {
+            prefix == next_prefix && next[0].0 >= first[0].0
+        }
+        _ => false,
+    }
+}
+
 fn follows(label: &str, next: &str) -> bool {
-    let parts = |value: &str| {
-        let value = value.strip_prefix("Aus").unwrap_or(value);
-        let prefix = value.bytes().take_while(u8::is_ascii_uppercase).count();
-        let numbers: Option<Vec<_>> = value[prefix..]
-            .split('.')
-            .map(|part| {
-                let digits = part.trim_end_matches(|c: char| c.is_ascii_uppercase());
-                Some((
-                    digits.parse::<u32>().ok()?,
-                    part.bytes().last().filter(u8::is_ascii_uppercase),
-                ))
-            })
-            .collect();
-        Some((value[..prefix].to_owned(), numbers?))
-    };
     let Some((prefix, current)) = parts(label) else {
         return false;
     };
@@ -125,30 +141,78 @@ fn follows(label: &str, next: &str) -> bool {
                 }))
 }
 
+/// One extracted line, or the part of it from `start` (a byte offset) when a deleted
+/// paragraph's marker and the next label share the line.
 struct Line<'a> {
     page: &'a Page,
     number: usize,
+    full: &'a str,
+    start: usize,
     text: &'a str,
     skip: bool,
+}
+
+/// Splits `C1 [Deleted by the AASB] AusC1.1 ...` after the marker when a label follows.
+fn after_deleted_marker(line: &str) -> Option<usize> {
+    let label = label_at(line)?;
+    let after_label = line.find(label)? + label.len();
+    let marker = after_label + line[after_label..].find('[')?;
+    if !plain_start(&line[after_label..]).starts_with("[Deleted") {
+        return None;
+    }
+    let close = marker + line[marker..].find(']')? + 1;
+    let rest = close + line[close..].find(|c: char| !c.is_whitespace())?;
+    label_at(&line[rest..]).map(|_| rest)
+}
+
+/// Copyright notice pages number their clauses like paragraphs; contents pages list labels.
+fn front_matter(page: &Page) -> bool {
+    page.text.lines().any(|line| {
+        let plain = plain_start(line).trim_end_matches(['*', '_']).trim();
+        plain == "CONTENTS"
+            || (footer(line) && plain.contains("CONTENTS"))
+            || plain == "COPYRIGHT"
+            || (plain.starts_with("AASB ") && plain.ends_with("COPYRIGHT"))
+    })
 }
 
 fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
     let mut lines = Vec::new();
     for page in pages {
-        let contents = page.text.lines().any(|line| {
-            let plain = plain_start(line).trim_end_matches('*').trim();
-            plain == "CONTENTS" || (footer(line) && plain.contains("CONTENTS"))
-        });
-        for (index, text) in page.text.lines().enumerate() {
+        let skip_page = front_matter(page);
+        for (index, full) in page.text.lines().enumerate() {
+            let skip = skip_page || footer(full) || reference_footnote(full);
+            let mut start = 0;
+            while let Some(split) = after_deleted_marker(&full[start..]).filter(|_| !skip) {
+                let end = full[..start + split].trim_end().len();
+                lines.push(Line {
+                    page,
+                    number: index + 1,
+                    full,
+                    start,
+                    text: &full[start..end],
+                    skip,
+                });
+                start += split;
+            }
             lines.push(Line {
                 page,
                 number: index + 1,
-                text,
-                skip: contents || footer(text) || reference_footnote(text),
+                full,
+                start,
+                text: &full[start..],
+                skip,
             });
         }
     }
     lines
+}
+
+/// True when a label that would follow `label` starts inside `text` after a sentence end.
+fn label_inside(label: &str, text: &str) -> bool {
+    text.match_indices(". ")
+        .filter_map(|(at, _)| label_at(&text[at + 2..]))
+        .any(|inner| follows(label, inner))
 }
 
 fn candidate(lines: &[Line<'_>], label: &str, start: usize, next: Option<&(usize, &str)>) -> Value {
@@ -168,6 +232,14 @@ fn candidate(lines: &[Line<'_>], label: &str, start: usize, next: Option<&(usize
     }
     let selected = &lines[start..end];
     reasons.extend(span_reasons(selected));
+    if selected
+        .iter()
+        .any(|line| !line.skip && label_inside(label, line.text))
+    {
+        reasons.push(
+            "A following paragraph label appears inside a line of this candidate; read the source page for where it ends.",
+        );
+    }
     let mut fragments = fragments(selected);
     let mut footnotes: Vec<_> = selected
         .iter()
@@ -227,11 +299,18 @@ fn fragments(selected: &[Line<'_>]) -> Vec<Value> {
                 .map(|line| line.text)
                 .collect::<Vec<_>>()
                 .join("\n");
-            fragments.push(
-                json!({"pdf_page":first.page.page,"start_line":first.number,"end_line":last.number,
+            let mut fragment = json!({"pdf_page":first.page.page,"start_line":first.number,"end_line":last.number,
                 "text":text,"page_text_sha256":hash(first.page.text.as_bytes()),
-                "provenance":first.page.provenance,"needs_review":first.page.needs_review}),
-            );
+                "provenance":first.page.provenance,"needs_review":first.page.needs_review});
+            // Columns are one-based characters, present only when a line is split.
+            if first.start > 0 {
+                fragment["start_column"] = json!(first.full[..first.start].chars().count() + 1);
+            }
+            let end = last.start + last.text.len();
+            if end < last.full.len() {
+                fragment["end_column"] = json!(last.full[..end].chars().count());
+            }
+            fragments.push(fragment);
         }
         chunk.clear();
     };
@@ -699,6 +778,96 @@ mod tests {
         );
         assert_eq!(found["candidates"][0]["reference_footnotes"][0]["line"], 2);
         assert_eq!(lookup(&pages, "21").unwrap()["status"], "not_found");
+    }
+
+    #[test]
+    fn copyright_notice_clauses_are_not_paragraphs() {
+        let pages = [
+            page(
+                2,
+                "COPYRIGHT\n1 Fabricated notice clause.\n2 Fabricated notice clause.\n3 Fabricated notice clause.",
+            ),
+            page(3, "4 Fabricated notice clause.\n**AASB 99 COPYRIGHT**"),
+            page(5, "3 Fabricated scope paragraph.\n4 Next paragraph."),
+        ];
+        let found = lookup(&pages, "3").unwrap();
+        assert_eq!(found["status"], "found");
+        assert_eq!(found["candidates"][0]["fragments"][0]["pdf_page"], 5);
+        assert_eq!(lookup(&pages, "4").unwrap()["candidate_count"], 1);
+        assert_eq!(lookup(&pages, "1").unwrap()["status"], "not_found");
+    }
+
+    #[test]
+    fn a_label_after_a_deleted_marker_anchors_on_the_same_line() {
+        let line = "C1 [Deleted by the AASB] AusC1.1 A fabricated effective date of 1 January";
+        let pages = [page(
+            1,
+            &format!("{line}\n\n2025. Fabricated earlier application.\nC1A Next paragraph."),
+        )];
+        let found = lookup(&pages, "AusC1.1").unwrap();
+        assert_eq!(found["status"], "found");
+        let fragment = &found["candidates"][0]["fragments"][0];
+        assert_eq!(
+            (fragment["start_line"].clone(), fragment["end_line"].clone()),
+            (json!(1), json!(3))
+        );
+        assert_eq!(fragment["start_column"], 26);
+        assert!(fragment.get("end_column").is_none());
+        assert_eq!(
+            fragment["text"],
+            format!("{}\n\n2025. Fabricated earlier application.", &line[25..])
+        );
+        let deleted = lookup(&pages, "C1").unwrap();
+        assert_eq!(deleted["status"], "found");
+        let fragment = &deleted["candidates"][0]["fragments"][0];
+        assert_eq!(fragment["text"], "C1 [Deleted by the AASB]");
+        assert_eq!(fragment["end_column"], 24);
+        assert!(fragment.get("start_column").is_none());
+        // Text after a marker that is not a label stays with the deleted paragraph.
+        let plain = [page(
+            1,
+            "5 [Deleted by the AASB] Fabricated heading\n6 Next.",
+        )];
+        assert_eq!(lookup(&plain, "5").unwrap()["status"], "found");
+        assert!(
+            lookup(&plain, "5").unwrap()["candidates"][0]["fragments"][0]
+                .get("end_column")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_following_label_inside_a_line_is_flagged() {
+        let pages = [page(
+            1,
+            "C3 Fabricated relief text. C4 In the first fabricated period.\nC5 Next.",
+        )];
+        let found = lookup(&pages, "C3").unwrap();
+        assert_eq!(found["status"], "needs_review");
+        let reasons = found["candidates"][0]["review_reasons"].to_string();
+        assert!(reasons.contains("inside a line"), "{reasons}");
+        // A reference or an unrelated number after a sentence end is not flagged.
+        let plain = lookup(
+            &[page(1, "C3 See paragraph C4. 2025 was a year.\nC4 Next.")],
+            "C3",
+        )
+        .unwrap();
+        assert_eq!(plain["status"], "found");
+    }
+
+    #[test]
+    fn series_continue_until_the_label_prefix_changes_or_restarts() {
+        for (a, b) in [
+            ("25", "Aus25.1"),
+            ("Aus25.1", "27"),
+            ("B1", "B9"),
+            ("C1", "AusC1.1"),
+        ] {
+            assert!(same_series(a, b), "{a} -> {b}");
+        }
+        for (a, b) in [("105", "B1"), ("C6", "C1"), ("5", "1"), ("BC9", "B10")] {
+            assert!(!same_series(a, b), "{a} -> {b}");
+        }
     }
 
     #[test]
