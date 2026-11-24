@@ -322,22 +322,14 @@ type ParagraphRow = (i64, String, u32, bool, Value, String);
 fn paragraph_rows(pages: &[Page]) -> Result<Vec<ParagraphRow>> {
     let mut rows = Vec::new();
     for (ordinal, anchored) in paragraphs::index(pages).into_iter().enumerate() {
-        let candidate = anchored.candidate;
-        let text = candidate["fragments"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|fragment| fragment["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let review = candidate["needs_review"] == true;
+        let review = anchored.candidate["needs_review"] == true;
         rows.push((
             i64::try_from(ordinal)?,
             anchored.label,
             anchored.pdf_page,
             review,
-            candidate,
-            text,
+            anchored.candidate,
+            anchored.text,
         ));
     }
     Ok(rows)
@@ -1538,6 +1530,27 @@ mod tests {
         fs::write(root.join("source/sample.pdf"), b"Changed source").unwrap();
         assert!(verify(&root, &connection).is_err());
     }
+    #[test]
+    fn oversized_paragraphs_keep_their_search_text() {
+        let text = format!(
+            "35 A fabricated requirement {}.\nfabricatedmarker ends it.\n36 Next.",
+            "word ".repeat(14_000)
+        );
+        let pages = [Page {
+            page: 1,
+            text,
+            provenance: "native".into(),
+            needs_review: false,
+        }];
+        let rows = paragraph_rows(&pages).unwrap();
+        let (_, label, _, review, candidate, search) = &rows[0];
+        assert_eq!(label, "35");
+        assert!(review);
+        assert_eq!(candidate["fragments"][0]["text"], Value::Null);
+        assert!(search.starts_with("35 A fabricated requirement word"));
+        assert!(search.ends_with("fabricatedmarker ends it."));
+    }
+
     #[test]
     fn verify_refuses_a_paragraph_table_that_differs_from_the_pages() {
         let root = fixture();
