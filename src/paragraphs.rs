@@ -1,5 +1,6 @@
 use crate::{Page, Result, hash};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 // Labels identify extracted text; uncertain boundaries must remain review items.
 pub(crate) fn valid_label(label: &str) -> bool {
@@ -176,15 +177,121 @@ fn front_matter(page: &Page) -> bool {
     })
 }
 
+/// The leading number of a label without a letter prefix, such as 13 for `13A` or `Aus13.1`.
+fn plain_number(label: &str) -> Option<u32> {
+    parts(label)
+        .filter(|(prefix, _)| prefix.is_empty())
+        .map(|(_, numbers)| numbers[0].0)
+}
+
+/// A numbered footnote at the foot of a page: a bare number that follows neither of the last
+/// two anchored labels and is below any plain number among them, after body text on the page
+/// rather than a heading. After it the page holds only wrapped text, higher footnotes, footers
+/// and running headers. Its line and any wrapped lines after it are not paragraph text.
+fn footnote_at(recent: [Option<&str>; 2], lines: &[&str], index: usize) -> bool {
+    let (Some(label), [Some(_), _]) = (label_at(lines[index]), recent) else {
+        return false;
+    };
+    let footnote = |label: &str| {
+        label.bytes().all(|b| b.is_ascii_digit())
+            && recent.iter().flatten().all(|anchored| {
+                !follows(anchored, label)
+                    && plain_number(anchored)
+                        .is_none_or(|number| plain_number(label) < Some(number))
+            })
+    };
+    let running =
+        |line: &str| footer(line) || (heading(line) && plain_start(line).starts_with("AASB "));
+    footnote(label)
+        && lines[..index]
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty() && !running(line))
+            .is_some_and(|line| !heading(line))
+        && lines[index + 1..].iter().all(|line| {
+            running(line)
+                || (!heading(line)
+                    && label_at(line).is_none_or(|later| {
+                        footnote(later) && plain_number(later) > plain_number(label)
+                    }))
+        })
+}
+
+/// Labels that start a sentence inside `text`, outside tables, with their byte offsets. A
+/// label followed by lower case is a cross-reference.
+fn sentence_labels(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let table = text.trim_start().starts_with('|') || text.contains("<table");
+    text.match_indices(". ")
+        .filter(move |_| !table)
+        .filter_map(move |(at, _)| {
+            let label = label_at(&text[at + 2..])?;
+            let body = plain_start(&text[at + 2..]);
+            let after = plain_start(&body[body.find(char::is_whitespace)?..]);
+            (after.starts_with(char::is_uppercase) || after.starts_with("[Deleted"))
+                .then_some((at + 2, label))
+        })
+}
+
+/// How often each label starts a line or a sentence outside front matter in the PDF.
+fn label_starts(pages: &[Page]) -> HashMap<&str, usize> {
+    let mut occurrences = HashMap::new();
+    for line in pages
+        .iter()
+        .filter(|page| !front_matter(page))
+        .flat_map(|page| page.text.lines())
+    {
+        for label in label_at(line)
+            .into_iter()
+            .chain(sentence_labels(line).map(|(_, label)| label))
+        {
+            *occurrences.entry(label).or_default() += 1;
+        }
+    }
+    occurrences
+}
+
+/// The joined text of a candidate's fragments, which a paragraph search matches.
+fn joined(fragments: &[Value]) -> String {
+    fragments
+        .iter()
+        .filter_map(|fragment| fragment["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
+    // A label inside a line anchors only when it is the only occurrence of that label at a
+    // line start or a sentence start in the PDF, so it never makes a lookup ambiguous.
+    let occurrences = label_starts(pages);
     let mut lines = Vec::new();
+    // The last two anchored labels, the current one first.
+    let mut recent: [Option<&str>; 2] = [None, None];
     for page in pages {
         let skip_page = front_matter(page);
-        for (index, full) in page.text.lines().enumerate() {
-            let skip = skip_page || footer(full) || reference_footnote(full);
+        let texts: Vec<&str> = page.text.lines().collect();
+        let (mut anchored_here, mut in_footnote) = (false, false);
+        for (index, full) in texts.iter().copied().enumerate() {
+            in_footnote =
+                in_footnote || (!skip_page && anchored_here && footnote_at(recent, &texts, index));
+            let skip = skip_page || in_footnote || footer(full) || reference_footnote(full);
             let mut start = 0;
-            while let Some(split) = after_deleted_marker(&full[start..]).filter(|_| !skip) {
-                let end = full[..start + split].trim_end().len();
+            loop {
+                let rest = &full[start..];
+                if !skip && let Some(label) = label_at(rest) {
+                    recent = [Some(label), recent[0]];
+                    anchored_here = true;
+                }
+                let following = |current: &str| {
+                    sentence_labels(rest)
+                        .find(|(_, inner)| {
+                            follows(current, inner) && occurrences.get(inner) == Some(&1)
+                        })
+                        .map(|(at, _)| at)
+                };
+                let split = (!skip)
+                    .then(|| after_deleted_marker(rest).or_else(|| recent[0].and_then(following)))
+                    .flatten();
+                let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
                 lines.push(Line {
                     page,
                     number: index + 1,
@@ -193,16 +300,11 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
                     text: &full[start..end],
                     skip,
                 });
-                start += split;
+                match split {
+                    Some(split) => start += split,
+                    None => break,
+                }
             }
-            lines.push(Line {
-                page,
-                number: index + 1,
-                full,
-                start,
-                text: &full[start..],
-                skip,
-            });
         }
     }
     lines
@@ -215,7 +317,14 @@ fn label_inside(label: &str, text: &str) -> bool {
         .any(|inner| follows(label, inner))
 }
 
-fn candidate(lines: &[Line<'_>], label: &str, start: usize, next: Option<&(usize, &str)>) -> Value {
+/// The candidate `lookup` reports and the text a paragraph search matches, which an
+/// oversized candidate keeps although its output withholds it.
+fn candidate(
+    lines: &[Line<'_>],
+    label: &str,
+    start: usize,
+    next: Option<&(usize, &str)>,
+) -> (Value, String) {
     let mut end = next.map_or(lines.len(), |(index, _)| *index);
     let mut reasons = Vec::new();
     if !next.is_some_and(|(_, next_label)| follows(label, next_label)) {
@@ -254,14 +363,16 @@ fn candidate(lines: &[Line<'_>], label: &str, start: usize, next: Option<&(usize
         .chain(&footnotes)
         .map(|f| f["text"].as_str().map_or(0, str::len))
         .sum();
+    let search = joined(&fragments);
     if bytes > 65_536 {
         reasons.push("The candidate exceeds 64 KiB; read the cited pages for its text.");
         for fragment in fragments.iter_mut().chain(&mut footnotes) {
             fragment["text"] = Value::Null;
         }
     }
-    json!({"needs_review":!reasons.is_empty(),"review_reasons":reasons,
-    "next_paragraph":next.map(|(_, label)| *label),"fragments":fragments,"reference_footnotes":footnotes})
+    let candidate = json!({"needs_review":!reasons.is_empty(),"review_reasons":reasons,
+    "next_paragraph":next.map(|(_, label)| *label),"fragments":fragments,"reference_footnotes":footnotes});
+    (candidate, search)
 }
 
 fn span_reasons(selected: &[Line<'_>]) -> Vec<&'static str> {
@@ -340,11 +451,13 @@ pub(crate) fn check_label(label: &str) -> Result<()> {
     Ok(())
 }
 
-/// One anchored paragraph: its label, the physical page of its anchor and its candidate.
+/// One anchored paragraph: its label, the physical page of its anchor, its candidate and
+/// its search text.
 pub(crate) struct Anchored {
     pub label: String,
     pub pdf_page: u32,
     pub candidate: Value,
+    pub text: String,
 }
 
 /// Every anchored paragraph of one PDF in reading order, delimited as `lookup` delimits it.
@@ -359,10 +472,14 @@ pub(crate) fn index(pages: &[Page]) -> Vec<Anchored> {
     anchors
         .iter()
         .enumerate()
-        .map(|(position, (start, label))| Anchored {
-            label: (*label).to_owned(),
-            pdf_page: lines[*start].page.page,
-            candidate: candidate(&lines, label, *start, anchors.get(position + 1)),
+        .map(|(position, (start, label))| {
+            let (candidate, text) = candidate(&lines, label, *start, anchors.get(position + 1));
+            Anchored {
+                label: (*label).to_owned(),
+                pdf_page: lines[*start].page.page,
+                candidate,
+                text,
+            }
         })
         .collect()
 }
@@ -837,22 +954,126 @@ mod tests {
     }
 
     #[test]
-    fn a_following_label_inside_a_line_is_flagged() {
+    fn a_following_label_after_a_sentence_end_anchors_mid_line() {
+        let first = "C1B Fabricated text. It ends here. C2 For the fabricated purposes.";
         let pages = [page(
             1,
-            "C3 Fabricated relief text. C4 In the first fabricated period.\nC5 Next.",
+            &format!(
+                "{first}\n\nC3 Fabricated relief. C4 In the first fabricated period.\n(a) A condition.\nC5 Next."
+            ),
         )];
-        let found = lookup(&pages, "C3").unwrap();
-        assert_eq!(found["status"], "needs_review");
-        let reasons = found["candidates"][0]["review_reasons"].to_string();
-        assert!(reasons.contains("inside a line"), "{reasons}");
-        // A reference or an unrelated number after a sentence end is not flagged.
-        let plain = lookup(
-            &[page(1, "C3 See paragraph C4. 2025 was a year.\nC4 Next.")],
+        let c1b = lookup(&pages, "C1B").unwrap();
+        assert_eq!(c1b["status"], "found");
+        let fragment = &c1b["candidates"][0]["fragments"][0];
+        assert_eq!(fragment["text"], "C1B Fabricated text. It ends here.");
+        assert_eq!(fragment["end_column"], 34);
+        let c2 = lookup(&pages, "C2").unwrap();
+        assert_eq!(c2["status"], "found");
+        let fragment = &c2["candidates"][0]["fragments"][0];
+        assert_eq!(fragment["text"], &first[35..]);
+        assert_eq!(fragment["start_column"], 36);
+        assert_eq!(lookup(&pages, "C3").unwrap()["status"], "found");
+        let c4 = lookup(&pages, "C4").unwrap();
+        assert_eq!(c4["status"], "found");
+        assert_eq!(
+            c4["candidates"][0]["fragments"][0]["text"],
+            "C4 In the first fabricated period.\n(a) A condition."
+        );
+    }
+
+    #[test]
+    fn mid_line_references_and_numbers_do_not_anchor() {
+        for text in [
+            // A reference that ends a sentence, then an unrelated number.
+            "C3 See paragraph C4. 2025 was a year.\nC4 Next.",
+            // The next label begins a sentence but is a reference: lower case follows it.
+            "C3 Fabricated text. C4 and C5 also apply.\nC4 Next.",
+            // A label out of sequence is a reference, not the next paragraph.
+            "C3 Fabricated text. C9 Applies instead.\nC4 Next.",
+            "C3 Fabricated text.\n| Cell ends. C4 In a table. |\nC4 Next.",
+            // A label repeated elsewhere in the PDF, as reproduced text repeats it, stays
+            // inside its line so that it cannot make a lookup ambiguous.
+            "C3 Fabricated text. C4 In the main text.\nC5 Next.\n## Reproduced\nC4 Copy.\nC5 Next.",
+        ] {
+            let pages = [page(1, text)];
+            assert_eq!(
+                lookup(&pages, "C4").unwrap()["candidate_count"],
+                1,
+                "{text}"
+            );
+            assert_eq!(
+                lookup(&pages, "C9").unwrap()["status"],
+                "not_found",
+                "{text}"
+            );
+        }
+        // A following label with lower case after it is still flagged for review.
+        let flagged = lookup(
+            &[page(
+                1,
+                "C3 Fabricated text. C4 and C5 also apply.\nC4 Next.",
+            )],
             "C3",
         )
         .unwrap();
-        assert_eq!(plain["status"], "found");
+        let reasons = flagged["candidates"][0]["review_reasons"].to_string();
+        assert!(reasons.contains("inside a line"), "{reasons}");
+    }
+
+    #[test]
+    fn out_of_sequence_footnotes_at_a_page_foot_are_not_paragraphs() {
+        let pages = [
+            page(5, "3 Fabricated scope paragraph.\n4 Next paragraph."),
+            page(
+                9,
+                "BC28 Fabricated basis.\nBC29 Fabricated feedback.\n\n3 *Fabricated Act 2001*, section 1. Fabricated\nconvention continues.\n\n**AASB 99-compiled BASIS FOR CONCLUSIONS**",
+            ),
+            page(10, "BC30 Next basis."),
+        ];
+        let found = lookup(&pages, "3").unwrap();
+        assert_eq!(found["status"], "found");
+        assert_eq!(found["candidates"][0]["fragments"][0]["pdf_page"], 5);
+        let bc29 = lookup(&pages, "BC29").unwrap();
+        assert_eq!(bc29["status"], "found");
+        assert_eq!(bc29["candidates"][0]["next_paragraph"], "BC30");
+        let text = bc29["candidates"][0]["fragments"].to_string();
+        assert!(
+            !text.contains("Fabricated Act") && !text.contains("convention"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn paragraphs_at_a_page_foot_that_are_not_footnotes_still_anchor() {
+        for (text, label) in [
+            // A gap in the sequence: a later number is not a footnote.
+            (
+                "12 Fabricated text.\n13 Fabricated text.\n\n15 Fabricated later paragraph.",
+                "15",
+            ),
+            // A series that restarts after a heading.
+            (
+                "BC29 Fabricated basis.\n\n## Fabricated heading\n\n1 Fabricated objective.",
+                "1",
+            ),
+            // A footnote is not followed by a lettered paragraph on its page.
+            (
+                "BC29 Fabricated basis.\n3 Fabricated text.\nB1 Fabricated guidance.",
+                "3",
+            ),
+        ] {
+            let found = lookup(&[page(1, text)], label).unwrap();
+            assert_eq!(found["candidate_count"], 1, "{text}");
+        }
+        // A page of numbered paragraphs with no anchor above them holds no footnote.
+        let pages = [
+            page(1, "C9 Fabricated transition."),
+            page(
+                2,
+                "# Fabricated deleted text\n*Fabricated note.*\n47 Fabricated text.\n48 Fabricated text.",
+            ),
+        ];
+        assert_eq!(lookup(&pages, "47").unwrap()["status"], "found");
     }
 
     #[test]
