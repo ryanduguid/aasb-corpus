@@ -1,5 +1,13 @@
 # Shared local AASB corpus
 
+<div align="center">
+
+[![licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-66023C?labelColor=000000&style=flat&color=66023C)](LICENSE)
+
+[Current local snapshot](#current-local-snapshot) · [Run](#run) · [Rebuild a new snapshot](#rebuild-a-new-snapshot) · [Checks](#checks) · [Reuse and licence](#reuse-and-licence)
+
+</div>
+
 Extract local AASB PDFs into page records and search them through a Rust CLI and SQLite FTS5 index. Results retain the source PDF hash, physical PDF page number, original URL and catalogue version metadata. The corpus is a finding aid; selecting an applicable reporting framework or version remains a separate review.
 
 The installed pdf-inspector exposes its extraction and offline OCR through Python, so `tools/extract.py` is the native extraction bridge. `tools/second_reader.py` reads the same PDFs with pypdf, already installed in that environment, to confirm paragraph lookups without a new dependency. Indexing, search, page lookup, quotation checks and verification are Rust. No command uploads documents, calls a model provider or downloads content.
@@ -172,3 +180,7 @@ Lookup then skipped notice pages and anchored labels after a deleted marker. Reb
 Quotation normalisation and regression cases adapt `fadden/as_at.py`; page completeness adapts the invariant in `fadden/extract.py`; staging follows the tax corpus's complete-output-before-promotion pattern. Upstream is [PaulGoodman](https://github.com/ryanduguid/PaulGoodman), formerly au-tax-legislation-corpus, at `84db0481a924f07d3f697f54a269917475613184`. Its tax date model, Register EPUB parser, attribution assumptions and publication filters are not used for AASB documents.
 
 Code is Apache-2.0; retain LICENSE and NOTICE. Source documents keep their own copyright notices and rights. This local build does not publish the corpus.
+
+---
+
+<p align="center"><sub><i>Congratulations, you just advanced a Standards level.</i><br>Made in Newcastle, Australia by <a href="https://duguid.com.au/">Ryan Duguid</a>.</sub></p>
