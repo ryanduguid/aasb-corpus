@@ -404,8 +404,8 @@ fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec
 
 /// True when a label that would follow `label` starts inside `text` after a sentence end.
 fn label_inside(label: &str, text: &str) -> bool {
-    text.match_indices(". ")
-        .filter_map(|(at, _)| label_at(&text[at + 2..]))
+    sentence_ends(text)
+        .filter_map(|(at, _)| label_at(&text[at..]))
         .any(|inner| follows(label, inner))
 }
 
@@ -1149,6 +1149,17 @@ mod tests {
         )
         .unwrap();
         let reasons = flagged["candidates"][0]["review_reasons"].to_string();
+        assert!(reasons.contains("inside a line"), "{reasons}");
+        // So is one after bold that reproduced text repeats.
+        let copy = lookup(
+            &[page(
+                1,
+                "C3 Fabricated text. C4 In the main text.\nC5 Next.\n## Reproduced\nC3 Copy.** C4 Copy.\nC5 Next.",
+            )],
+            "C3",
+        )
+        .unwrap();
+        let reasons = copy["candidates"][1]["review_reasons"].to_string();
         assert!(reasons.contains("inside a line"), "{reasons}");
     }
 
