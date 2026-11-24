@@ -232,10 +232,9 @@ fn sentence_labels(text: &str) -> impl Iterator<Item = (usize, &str)> {
         })
 }
 
-fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
-    // A label inside a line anchors only when it is the only occurrence of that label at a
-    // line start or a sentence start in the PDF, so it never makes a lookup ambiguous.
-    let mut occurrences = HashMap::<&str, usize>::new();
+/// How often each label starts a line or a sentence outside front matter in the PDF.
+fn label_starts(pages: &[Page]) -> HashMap<&str, usize> {
+    let mut occurrences = HashMap::new();
     for line in pages
         .iter()
         .filter(|page| !front_matter(page))
@@ -248,6 +247,22 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
             *occurrences.entry(label).or_default() += 1;
         }
     }
+    occurrences
+}
+
+/// The joined text of a candidate's fragments, which a paragraph search matches.
+fn joined(fragments: &[Value]) -> String {
+    fragments
+        .iter()
+        .filter_map(|fragment| fragment["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
+    // A label inside a line anchors only when it is the only occurrence of that label at a
+    // line start or a sentence start in the PDF, so it never makes a lookup ambiguous.
+    let occurrences = label_starts(pages);
     let mut lines = Vec::new();
     // The last two anchored labels, the current one first.
     let mut recent: [Option<&str>; 2] = [None, None];
@@ -348,11 +363,7 @@ fn candidate(
         .chain(&footnotes)
         .map(|f| f["text"].as_str().map_or(0, str::len))
         .sum();
-    let search = fragments
-        .iter()
-        .filter_map(|fragment| fragment["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let search = joined(&fragments);
     if bytes > 65_536 {
         reasons.push("The candidate exceeds 64 KiB; read the cited pages for its text.");
         for fragment in fragments.iter_mut().chain(&mut footnotes) {
