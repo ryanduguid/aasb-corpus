@@ -9,6 +9,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Component, Path};
 use unicode_normalization::UnicodeNormalization;
 
+mod checklist;
+use checklist::gap_check;
 mod derived;
 mod mcp;
 mod paragraphs;
@@ -1397,7 +1399,7 @@ fn run() -> Result<Value> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.len() < 2 {
         return Err(
-            "usage: aasb-corpus <build|stats|catalogue|search|paragraph|page|verify-quote|verify|mcp> SNAPSHOT [arguments]"
+            "usage: aasb-corpus <build|stats|catalogue|search|paragraph|page|verify-quote|verify|checklist|gap-check|mcp> SNAPSHOT [arguments]"
                 .into(),
         );
     }
@@ -1427,6 +1429,8 @@ fn run() -> Result<Value> {
         ),
         "page" if arguments.len() == 4 => page(&connection, &arguments[2], arguments[3].parse()?),
         "verify" if arguments.len() == 2 => verify(root, &connection),
+        "checklist" if arguments.len() == 3 => checklist::checklist(&connection, &arguments[2]),
+        "gap-check" if arguments.len() == 4 => gap_check(&connection, &arguments[2], &arguments[3]),
         "verify-quote" if arguments.len() == 4 => {
             verify_quote(root, &connection, &arguments[2], None, &arguments[3])
         }

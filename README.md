@@ -106,6 +106,12 @@ An index before schema 4 omits these fields. From schema 4, `verify` also re-der
 
 `page SNAPSHOT SHA256 PAGE` returns a full extracted page.
 
+### AASB S2 disclosure checklist
+
+`checklist SNAPSHOT SHA256` lists the disclosure requirements of one AASB S2 PDF from its stored paragraphs. A requirement is a paragraph outside the Basis for Conclusions, illustrative examples and implementation guidance (labels `BC`, `IE`, `IG`) whose text says an entity 'shall disclose' or 'shall also disclose', ignoring case, emphasis and line breaks. Each carries an `id` (`AASB S2|<compilation>|<label>`), the compilation's version label, the paragraph label and its PDF page, never the standard's text. It needs review when its stored paragraph does or when its label is stored more than once. The rule keys a requirement to its paragraph: lettered clauses stay inside it, and a requirement worded otherwise is not listed. On the schema 4 snapshot with the 21 November catalogue, the September 2024 version lists 37 requirements (20 need review) and the December 2025 compilation 34 (16).
+
+`gap-check SNAPSHOT SHA256 RESULT` checks a filled-in gap analysis, shaped as the checklist's `result_schema`: the same `document_sha256` and one result for each requirement `id`. A `satisfied` result carries the exact `quote` from the report and its `location` (page or section); a `not_satisfied` one carries the `missing` element. Any other shape, a missing or repeated `id`, or an `id` not in the checklist is an error. Neither command reads or judges a report: whether a quote is in the report and meets the requirement stays with the reader.
+
 ### Check a quotation
 
 ```powershell
