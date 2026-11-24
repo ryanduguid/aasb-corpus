@@ -13,7 +13,9 @@ indications assets impaired	AASB 136	12
 recoverable amount higher	AASB 136	18
 goodwill allocated "cash-generating" units	AASB 136	80
 provision recognised present obligation	AASB 137	14
-onerous contracts	AASB 137	66
+# AASB 137 changed on 24 November 2026 from 66 to 67, the paragraph on onerous contracts that holds both
+# words: 66 says 'contract' and matched only whilst its candidate ran on into 67 and 68.
+onerous contracts	AASB 137	67
 contingent liabilities not recognised	AASB 137	27
 residual value useful life reviewed	AASB 116	51
 revaluation model carried revalued amount	AASB 116	31

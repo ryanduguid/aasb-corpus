@@ -272,7 +272,7 @@ fn row_anchor<'a>(
 ) -> Option<&'a str> {
     table_label(line).map(|(label, _)| label).filter(|label| {
         current.is_some_and(|current| follows(current, label))
-            && matches!(occurrences.get(label), Some((0, 1, _)))
+            && occurrences.get(label) == Some(&(0, 1, 0))
     })
 }
 
@@ -1280,6 +1280,8 @@ mod tests {
             "3 Fabricated text.\n|4|units sold|\n5 Next.",
             // The label also starts a line elsewhere, so the row would make it ambiguous.
             "3 Fabricated text.\n|4|Fabricated cell.|\n4 Fabricated paragraph.\n5 Next.",
+            // The same when it starts a sentence after closing bold.
+            "3 Fabricated text.\n|4|Fabricated cell.|\n## Reproduced\n**3 Fabricated rule.** 4 Fabricated paragraph.\n5 Next.",
             // The first cell holds more than a label.
             "3 Fabricated text.\n|4 and 5|Fabricated cell.|\n6 Next.",
         ] {
