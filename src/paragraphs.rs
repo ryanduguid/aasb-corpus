@@ -338,6 +338,22 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
     lines_with(pages, &label_starts(pages, &skipped))
 }
 
+/// The byte offset in `text` of the first sentence label that follows `current` and anchors.
+fn following(text: &str, current: &str, occurrences: &HashMap<&str, Starts>) -> Option<usize> {
+    sentence_labels(text)
+        .find(|(_, inner, plain)| {
+            follows(current, inner)
+                && occurrences.get(inner).is_some_and(|starts| {
+                    if *plain {
+                        starts.0 == 1
+                    } else {
+                        *starts == (0, 0, 1)
+                    }
+                })
+        })
+        .map(|(at, _, _)| at)
+}
+
 fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     // The last two anchored labels, the current one first.
@@ -359,22 +375,11 @@ fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec
                     recent = [Some(label), recent[0]];
                     anchored_here = true;
                 }
-                let following = |current: &str| {
-                    sentence_labels(rest)
-                        .find(|(_, inner, plain)| {
-                            follows(current, inner)
-                                && occurrences.get(inner).is_some_and(|starts| {
-                                    if *plain {
-                                        starts.0 == 1
-                                    } else {
-                                        *starts == (0, 0, 1)
-                                    }
-                                })
-                        })
-                        .map(|(at, _, _)| at)
-                };
                 let split = (!skip)
-                    .then(|| after_deleted_marker(rest).or_else(|| recent[0].and_then(following)))
+                    .then(|| {
+                        after_deleted_marker(rest)
+                            .or_else(|| following(rest, recent[0]?, occurrences))
+                    })
                     .flatten();
                 let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
                 let text = &full[start..end];
