@@ -1,6 +1,6 @@
 use crate::{Page, Result, hash};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Labels identify extracted text; uncertain boundaries must remain review items.
 pub(crate) fn valid_label(label: &str) -> bool {
@@ -220,18 +220,33 @@ fn footnote_at(recent: [Option<&str>; 2], lines: &[&str], index: usize) -> bool 
         })
 }
 
-/// Labels that start a sentence inside `text`, outside tables, with their byte offsets. A
-/// label followed by lower case is a cross-reference.
-fn sentence_labels(text: &str) -> impl Iterator<Item = (usize, &str)> {
+/// Byte offsets after each sentence end in `text`, and whether it is a plain `. `. Otherwise a
+/// footnote marker or closing bold sits between the full stop and the space, as extraction
+/// gives `entity.¹** 2 This` and `risks.** 6 To`.
+fn sentence_ends(text: &str) -> impl Iterator<Item = (usize, bool)> {
+    text.match_indices('.').filter_map(move |(at, _)| {
+        let rest =
+            text[at + 1..].trim_start_matches(['¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁰']);
+        let rest = rest.strip_prefix("**").unwrap_or(rest);
+        let plain = text.len() - rest.len() == at + 1;
+        rest.strip_prefix(' ')
+            .map(|after| (text.len() - after.len(), plain))
+    })
+}
+
+/// Labels that start a sentence inside `text`, outside tables, with their byte offsets and
+/// whether a plain `. ` ends the sentence before them. A label followed by lower case is a
+/// cross-reference.
+fn sentence_labels(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
     let table = text.trim_start().starts_with('|') || text.contains("<table");
-    text.match_indices(". ")
+    sentence_ends(text)
         .filter(move |_| !table)
-        .filter_map(move |(at, _)| {
-            let label = label_at(&text[at + 2..])?;
-            let body = plain_start(&text[at + 2..]);
+        .filter_map(move |(at, plain)| {
+            let label = label_at(&text[at..])?;
+            let body = plain_start(&text[at..]);
             let after = plain_start(&body[body.find(char::is_whitespace)?..]);
             (after.starts_with(char::is_uppercase) || after.starts_with("[Deleted"))
-                .then_some((at + 2, label))
+                .then_some((at, label, plain))
         })
 }
 
@@ -257,32 +272,43 @@ fn row_anchor<'a>(
 ) -> Option<&'a str> {
     table_label(line).map(|(label, _)| label).filter(|label| {
         current.is_some_and(|current| follows(current, label))
-            && occurrences.get(label) == Some(&(0, 1))
+            && matches!(occurrences.get(label), Some((0, 1, _)))
     })
 }
 
-/// How often a label starts a line or a sentence, and how often a table row.
-type Starts = (usize, usize);
+/// How often a label starts a line or a sentence after a plain `. `, how often a table row,
+/// and how often a sentence after a footnote marker or closing bold.
+type Starts = (usize, usize, usize);
 
-/// How often each label starts a line or a sentence, and a table row, outside front matter
-/// in the PDF.
-fn label_starts(pages: &[Page]) -> HashMap<&str, Starts> {
+/// How often each label starts a line, a sentence or a table row in the PDF, outside front
+/// matter and the `skipped` lines (page and line numbers).
+fn label_starts<'a>(
+    pages: &'a [Page],
+    skipped: &HashSet<(u32, usize)>,
+) -> HashMap<&'a str, Starts> {
     let mut occurrences = HashMap::new();
-    for line in pages
-        .iter()
-        .filter(|page| !front_matter(page))
-        .flat_map(|page| page.text.lines())
-    {
-        // A row does not count against a label inside a line: a Basis for Conclusions table
-        // can list paragraphs that the main text holds mid-line.
-        for label in label_at(line)
-            .into_iter()
-            .chain(sentence_labels(line).map(|(_, label)| label))
-        {
-            occurrences.entry(label).or_insert((0, 0)).0 += 1;
-        }
-        if let Some((label, _)) = table_label(line) {
-            occurrences.entry(label).or_insert((0, 0)).1 += 1;
+    for page in pages.iter().filter(|page| !front_matter(page)) {
+        for (index, line) in page.text.lines().enumerate() {
+            if skipped.contains(&(page.page, index + 1)) {
+                continue;
+            }
+            // A row does not count against a label inside a line: a Basis for Conclusions
+            // table can list paragraphs that the main text holds mid-line.
+            for (label, plain) in label_at(line)
+                .map(|label| (label, true))
+                .into_iter()
+                .chain(sentence_labels(line).map(|(_, label, plain)| (label, plain)))
+            {
+                let starts = occurrences.entry(label).or_insert((0, 0, 0));
+                if plain {
+                    starts.0 += 1;
+                } else {
+                    starts.2 += 1;
+                }
+            }
+            if let Some((label, _)) = table_label(line) {
+                occurrences.entry(label).or_insert((0, 0, 0)).1 += 1;
+            }
         }
     }
     occurrences
@@ -297,10 +323,38 @@ fn joined(fragments: &[Value]) -> String {
         .join("\n")
 }
 
+/// A label inside a line anchors only when it is the only occurrence of that label at a line
+/// start or a sentence start in the PDF, so it never makes a lookup ambiguous. Lines that a
+/// first reading skips, such as page-foot footnotes, do not count. A label after a footnote
+/// marker or closing bold also needs no other start or row, and does not count against a
+/// label after a plain `. `: reproduced text can repeat a main-text label after bold.
 fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
-    // A label inside a line anchors only when it is the only occurrence of that label at a
-    // line start or a sentence start in the PDF, so it never makes a lookup ambiguous.
-    let occurrences = label_starts(pages);
+    let first = lines_with(pages, &label_starts(pages, &HashSet::new()));
+    let skipped = first
+        .iter()
+        .filter(|line| line.skip)
+        .map(|line| (line.page.page, line.number))
+        .collect();
+    lines_with(pages, &label_starts(pages, &skipped))
+}
+
+/// The byte offset in `text` of the first sentence label that follows `current` and anchors.
+fn following(text: &str, current: &str, occurrences: &HashMap<&str, Starts>) -> Option<usize> {
+    sentence_labels(text)
+        .find(|(_, inner, plain)| {
+            follows(current, inner)
+                && occurrences.get(inner).is_some_and(|starts| {
+                    if *plain {
+                        starts.0 == 1
+                    } else {
+                        *starts == (0, 0, 1)
+                    }
+                })
+        })
+        .map(|(at, _, _)| at)
+}
+
+fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     // The last two anchored labels, the current one first.
     let mut recent: [Option<&str>; 2] = [None, None];
@@ -316,21 +370,16 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
             loop {
                 let rest = &full[start..];
                 // Table rows never split, so a row's label is always at its start.
-                let row = row_anchor(full, recent[0], &occurrences).filter(|_| !skip);
+                let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip);
                 if let Some(label) = label_at(rest).filter(|_| !skip).or(row) {
                     recent = [Some(label), recent[0]];
                     anchored_here = true;
                 }
-                let following = |current: &str| {
-                    sentence_labels(rest)
-                        .find(|(_, inner)| {
-                            follows(current, inner)
-                                && occurrences.get(inner).is_some_and(|starts| starts.0 == 1)
-                        })
-                        .map(|(at, _)| at)
-                };
                 let split = (!skip)
-                    .then(|| after_deleted_marker(rest).or_else(|| recent[0].and_then(following)))
+                    .then(|| {
+                        after_deleted_marker(rest)
+                            .or_else(|| following(rest, recent[0]?, occurrences))
+                    })
                     .flatten();
                 let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
                 let text = &full[start..end];
@@ -355,8 +404,8 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
 
 /// True when a label that would follow `label` starts inside `text` after a sentence end.
 fn label_inside(label: &str, text: &str) -> bool {
-    text.match_indices(". ")
-        .filter_map(|(at, _)| label_at(&text[at + 2..]))
+    sentence_ends(text)
+        .filter_map(|(at, _)| label_at(&text[at..]))
         .any(|inner| follows(label, inner))
 }
 
@@ -1030,8 +1079,41 @@ mod tests {
     }
 
     #[test]
+    fn a_sentence_end_inside_bold_or_after_a_footnote_marker_anchors_mid_line() {
+        let first =
+            "**1 Fabricated aim for a test entity.¹** 2 This rule asks for fabricated words.";
+        let third = "**3 Fabricated scope words.** 4 To meet it, an entity shall add words.";
+        // A page-foot footnote numbered like a paragraph does not stop it anchoring mid-line.
+        let pages = [
+            page(
+                1,
+                &format!(
+                    "## Objective\n\n{first}\n\n## Scope\n\n{third}\n5 Next.\n1 Fabricated footnote words."
+                ),
+            ),
+            page(
+                2,
+                "B1 Fabricated guidance words.\n\n2 Fabricated footnote words.\n\n**AASB S2-compiled APPENDIX B**",
+            ),
+        ];
+        for (label, text) in [
+            ("1", "**1 Fabricated aim for a test entity.¹**"),
+            ("2", "2 This rule asks for fabricated words."),
+            ("3", "**3 Fabricated scope words.**"),
+            ("4", "4 To meet it, an entity shall add words."),
+        ] {
+            let found = lookup(&pages, label).unwrap();
+            assert_eq!(found["status"], "found", "{label}");
+            assert_eq!(found["candidates"][0]["fragments"][0]["text"], text);
+        }
+    }
+
+    #[test]
     fn mid_line_references_and_numbers_do_not_anchor() {
         for text in [
+            // The same after a sentence end inside bold or after a footnote marker.
+            "C3 Fabricated text.** C4 and C5 also apply.\nC4 Next.",
+            "C3 Fabricated text.¹** C9 Applies instead.\nC4 Next.",
             // A reference that ends a sentence, then an unrelated number.
             "C3 See paragraph C4. 2025 was a year.\nC4 Next.",
             // The next label begins a sentence but is a reference: lower case follows it.
@@ -1042,6 +1124,8 @@ mod tests {
             // A label repeated elsewhere in the PDF, as reproduced text repeats it, stays
             // inside its line so that it cannot make a lookup ambiguous.
             "C3 Fabricated text. C4 In the main text.\nC5 Next.\n## Reproduced\nC4 Copy.\nC5 Next.",
+            // A copy after bold leaves the main text's label its anchor.
+            "C3 Fabricated text. C4 In the main text.\nC5 Next.\n## Reproduced\nC3 Copy.** C4 Copy.\nC5 Next.",
         ] {
             let pages = [page(1, text)];
             assert_eq!(
@@ -1065,6 +1149,17 @@ mod tests {
         )
         .unwrap();
         let reasons = flagged["candidates"][0]["review_reasons"].to_string();
+        assert!(reasons.contains("inside a line"), "{reasons}");
+        // So is one after bold that reproduced text repeats.
+        let copy = lookup(
+            &[page(
+                1,
+                "C3 Fabricated text. C4 In the main text.\nC5 Next.\n## Reproduced\nC3 Copy.** C4 Copy.\nC5 Next.",
+            )],
+            "C3",
+        )
+        .unwrap();
+        let reasons = copy["candidates"][1]["review_reasons"].to_string();
         assert!(reasons.contains("inside a line"), "{reasons}");
     }
 
