@@ -1030,8 +1030,33 @@ mod tests {
     }
 
     #[test]
+    fn a_sentence_end_inside_bold_or_after_a_footnote_marker_anchors_mid_line() {
+        let first = "**1 Fabricated aim for a test entity.¹** 2 This rule asks for fabricated words.";
+        let third = "**3 Fabricated scope words.** 4 To meet it, an entity shall add words.";
+        let pages = [page(
+            1,
+            &format!(
+                "## Objective\n\n{first}\n\n## Scope\n\n{third}\n5 Next.\n1 Fabricated footnote words."
+            ),
+        )];
+        for (label, text) in [
+            ("1", "**1 Fabricated aim for a test entity.¹**"),
+            ("2", "2 This rule asks for fabricated words."),
+            ("3", "**3 Fabricated scope words.**"),
+            ("4", "4 To meet it, an entity shall add words."),
+        ] {
+            let found = lookup(&pages, label).unwrap();
+            assert_eq!(found["status"], "found", "{label}");
+            assert_eq!(found["candidates"][0]["fragments"][0]["text"], text);
+        }
+    }
+
+    #[test]
     fn mid_line_references_and_numbers_do_not_anchor() {
         for text in [
+            // The same after a sentence end inside bold or after a footnote marker.
+            "C3 Fabricated text.** C4 and C5 also apply.\nC4 Next.",
+            "C3 Fabricated text.¹** C9 Applies instead.\nC4 Next.",
             // A reference that ends a sentence, then an unrelated number.
             "C3 See paragraph C4. 2025 was a year.\nC4 Next.",
             // The next label begins a sentence but is a reference: lower case follows it.
