@@ -220,18 +220,29 @@ fn footnote_at(recent: [Option<&str>; 2], lines: &[&str], index: usize) -> bool 
         })
 }
 
+/// Byte offsets after each sentence end in `text`: a full stop, then any footnote marker and
+/// closing bold, then a space, as extraction gives `entity.¹** 2 This` and `risks.** 6 To`.
+fn sentence_ends(text: &str) -> impl Iterator<Item = usize> {
+    text.match_indices('.').filter_map(move |(at, _)| {
+        let rest = text[at + 1..]
+            .trim_start_matches(['¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁰'])
+            .trim_start_matches('*');
+        rest.strip_prefix(' ').map(|after| text.len() - after.len())
+    })
+}
+
 /// Labels that start a sentence inside `text`, outside tables, with their byte offsets. A
 /// label followed by lower case is a cross-reference.
 fn sentence_labels(text: &str) -> impl Iterator<Item = (usize, &str)> {
     let table = text.trim_start().starts_with('|') || text.contains("<table");
-    text.match_indices(". ")
+    sentence_ends(text)
         .filter(move |_| !table)
-        .filter_map(move |(at, _)| {
-            let label = label_at(&text[at + 2..])?;
-            let body = plain_start(&text[at + 2..]);
+        .filter_map(move |at| {
+            let label = label_at(&text[at..])?;
+            let body = plain_start(&text[at..]);
             let after = plain_start(&body[body.find(char::is_whitespace)?..]);
             (after.starts_with(char::is_uppercase) || after.starts_with("[Deleted"))
-                .then_some((at + 2, label))
+                .then_some((at, label))
         })
 }
 
