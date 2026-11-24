@@ -151,6 +151,8 @@ struct Line<'a> {
     start: usize,
     text: &'a str,
     skip: bool,
+    /// The paragraph label this line starts, if it anchors one.
+    anchor: Option<&'a str>,
 }
 
 /// Splits `C1 [Deleted by the AASB] AusC1.1 ...` after the marker when a label follows.
@@ -209,9 +211,10 @@ fn footnote_at(recent: [Option<&str>; 2], lines: &[&str], index: usize) -> bool 
             .find(|line| !line.trim().is_empty() && !running(line))
             .is_some_and(|line| !heading(line))
         && lines[index + 1..].iter().all(|line| {
+            // An underlined label is a paragraph an amending standard inserts.
             running(line)
                 || (!heading(line)
-                    && label_at(line).is_none_or(|later| {
+                    && label_at(line.trim_start().trim_start_matches("<u>")).is_none_or(|later| {
                         footnote(later) && plain_number(later) > plain_number(label)
                     }))
         })
@@ -232,19 +235,54 @@ fn sentence_labels(text: &str) -> impl Iterator<Item = (usize, &str)> {
         })
 }
 
-/// How often each label starts a line or a sentence outside front matter in the PDF.
-fn label_starts(pages: &[Page]) -> HashMap<&str, usize> {
+/// A label alone in the first cell of a table row with text in the next cell, as extraction
+/// gives `|4|Climate-related ...|||` for a paragraph laid out beside a table. Also returns
+/// whether every later cell is empty, so the row holds nothing but the paragraph.
+fn table_label(line: &str) -> Option<(&str, bool)> {
+    let mut cells = line.trim().strip_prefix('|')?.split('|');
+    let label = plain_start(cells.next()?)
+        .trim_end()
+        .trim_end_matches(['*', '_']);
+    let body = plain_start(cells.next()?);
+    (valid_label(label) && (body.starts_with(char::is_uppercase) || body.starts_with("[Deleted")))
+        .then(|| (label, cells.all(|cell| cell.trim().is_empty())))
+}
+
+/// A table row's label, which anchors only when it follows the current label and starts no
+/// line, sentence or other row in the PDF.
+fn row_anchor<'a>(
+    line: &'a str,
+    current: Option<&str>,
+    occurrences: &HashMap<&str, Starts>,
+) -> Option<&'a str> {
+    table_label(line).map(|(label, _)| label).filter(|label| {
+        current.is_some_and(|current| follows(current, label))
+            && occurrences.get(label) == Some(&(0, 1))
+    })
+}
+
+/// How often a label starts a line or a sentence, and how often a table row.
+type Starts = (usize, usize);
+
+/// How often each label starts a line or a sentence, and a table row, outside front matter
+/// in the PDF.
+fn label_starts(pages: &[Page]) -> HashMap<&str, Starts> {
     let mut occurrences = HashMap::new();
     for line in pages
         .iter()
         .filter(|page| !front_matter(page))
         .flat_map(|page| page.text.lines())
     {
+        // A row does not count against a label inside a line: a Basis for Conclusions table
+        // can list paragraphs that the main text holds mid-line.
         for label in label_at(line)
             .into_iter()
             .chain(sentence_labels(line).map(|(_, label)| label))
         {
-            *occurrences.entry(label).or_default() += 1;
+            occurrences.entry(label).or_insert((0, 0)).0 += 1;
+        }
+        if let Some((label, _)) = table_label(line) {
+            occurrences.entry(label).or_insert((0, 0)).1 += 1;
         }
     }
     occurrences
@@ -277,14 +315,17 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
             let mut start = 0;
             loop {
                 let rest = &full[start..];
-                if !skip && let Some(label) = label_at(rest) {
+                // Table rows never split, so a row's label is always at its start.
+                let row = row_anchor(full, recent[0], &occurrences).filter(|_| !skip);
+                if let Some(label) = label_at(rest).filter(|_| !skip).or(row) {
                     recent = [Some(label), recent[0]];
                     anchored_here = true;
                 }
                 let following = |current: &str| {
                     sentence_labels(rest)
                         .find(|(_, inner)| {
-                            follows(current, inner) && occurrences.get(inner) == Some(&1)
+                            follows(current, inner)
+                                && occurrences.get(inner).is_some_and(|starts| starts.0 == 1)
                         })
                         .map(|(at, _)| at)
                 };
@@ -292,13 +333,15 @@ fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
                     .then(|| after_deleted_marker(rest).or_else(|| recent[0].and_then(following)))
                     .flatten();
                 let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
+                let text = &full[start..end];
                 lines.push(Line {
                     page,
                     number: index + 1,
                     full,
                     start,
-                    text: &full[start..end],
+                    text,
                     skip,
+                    anchor: row.or_else(|| label_at(text).filter(|_| !skip)),
                 });
                 match split {
                     Some(split) => start += split,
@@ -389,8 +432,14 @@ fn span_reasons(selected: &[Line<'_>]) -> Vec<&'static str> {
     {
         reasons.push("The source span includes OCR or a page flagged for review.");
     }
+    // A row holding only the candidate's own label and text is a paragraph, not a table.
+    let own_row = |line: &Line<'_>| {
+        table_label(line.text).is_some_and(|(label, alone)| alone && line.anchor == Some(label))
+    };
     if selected.iter().any(|line| {
-        !line.skip && (line.text.trim_start().starts_with('|') || line.text.contains("<table"))
+        !line.skip
+            && !own_row(line)
+            && (line.text.trim_start().starts_with('|') || line.text.contains("<table"))
     }) {
         reasons.push("The candidate includes a table whose layout requires source review.");
     }
@@ -466,8 +515,7 @@ pub(crate) fn index(pages: &[Page]) -> Vec<Anchored> {
     let anchors: Vec<_> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| !line.skip)
-        .filter_map(|(i, line)| label_at(line.text).map(|label| (i, label)))
+        .filter_map(|(i, line)| line.anchor.map(|label| (i, label)))
         .collect();
     anchors
         .iter()
@@ -1074,6 +1122,79 @@ mod tests {
             ),
         ];
         assert_eq!(lookup(&pages, "47").unwrap()["status"], "found");
+        // An amending standard numbers its instructions between reproduced paragraphs; an
+        // instruction followed by an underlined inserted paragraph is not a footnote.
+        let pages = [
+            page(
+                5,
+                "5 Paragraph 93 is amended.\n28 Fabricated reproduced text.",
+            ),
+            page(
+                6,
+                "93 Fabricated reproduced text.\n\n6 Paragraph AusC6.1 is added.\n\n<u>AusC6.1 Fabricated inserted text.</u>\n\n## AASB 9999-9 STANDARD",
+            ),
+            page(7, "7 Paragraph 99 is deleted."),
+        ];
+        assert_eq!(lookup(&pages, "6").unwrap()["status"], "found");
+    }
+
+    #[test]
+    fn a_label_alone_in_a_table_rows_first_cell_anchors_in_sequence() {
+        // The shape extraction gives a paragraph laid out beside a table's last row.
+        let text = "**3 This Standard applies to:**\n\n**(a) fabricated risks, which are:**\n\n|||(i)|fabricated physical risks; and|\n|---|---|---|---|\n||(b)|(ii) fabricated opportunities.|fabricated transition risks; and|\n|4|Fabricated risks that cannot affect prospects are outside its scope.|||\n\n## Fabricated heading\n\n**5 The fabricated objective.**";
+        let pages = [page(7, text)];
+        let four = lookup(&pages, "4").unwrap();
+        assert_eq!(four["status"], "found");
+        assert_eq!(
+            four["candidates"][0]["fragments"][0]["text"],
+            "|4|Fabricated risks that cannot affect prospects are outside its scope.|||"
+        );
+        // Paragraph 3 now ends at 4, but its own garbled table rows still need review.
+        let three = &lookup(&pages, "3").unwrap()["candidates"][0];
+        assert_eq!(three["next_paragraph"], "4");
+        let reasons = three["review_reasons"].to_string();
+        assert!(!reasons.contains("No adjacent"), "{reasons}");
+        assert!(reasons.contains("table"), "{reasons}");
+        // A Basis for Conclusions table listing a paragraph does not stop the paragraph
+        // anchoring inside a line.
+        let pages = [
+            page(
+                9,
+                "Aus1.15 Fabricated text. Aus1.15.1 In respect of fabricated entities.\nAus1.16 Next.",
+            ),
+            page(
+                57,
+                "BC5 Fabricated basis.\n|Aus1.15.1|To clarify fabricated text.|",
+            ),
+        ];
+        assert_eq!(lookup(&pages, "Aus1.15.1").unwrap()["status"], "found");
+        // A row whose other cells hold text anchors but stays a review item.
+        let row = "3 Fabricated text.\n|4|Fabricated cell.|Other cell.|\n5 Next.";
+        assert_eq!(
+            lookup(&[page(1, row)], "4").unwrap()["status"],
+            "needs_review"
+        );
+    }
+
+    #[test]
+    fn ordinary_numbered_table_rows_do_not_anchor() {
+        for text in [
+            // Out of sequence with the current paragraph.
+            "12 Fabricated text.\n|1|Revenue|100|\n|2|Expenses|50|\n13 Next.",
+            // Lower case after the number: a quantity, not a paragraph.
+            "3 Fabricated text.\n|4|units sold|\n5 Next.",
+            // The label also starts a line elsewhere, so the row would make it ambiguous.
+            "3 Fabricated text.\n|4|Fabricated cell.|\n4 Fabricated paragraph.\n5 Next.",
+            // The first cell holds more than a label.
+            "3 Fabricated text.\n|4 and 5|Fabricated cell.|\n6 Next.",
+        ] {
+            let pages = [page(1, text)];
+            for label in ["1", "2", "4"] {
+                let found = lookup(&pages, label).unwrap();
+                let expected = u64::from(label == "4" && text.contains("\n4 Fabricated"));
+                assert_eq!(found["candidate_count"], expected, "{label} in {text}");
+            }
+        }
     }
 
     #[test]
