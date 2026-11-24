@@ -224,9 +224,9 @@ fn footnote_at(recent: [Option<&str>; 2], lines: &[&str], index: usize) -> bool 
 /// closing bold, then a space, as extraction gives `entity.¹** 2 This` and `risks.** 6 To`.
 fn sentence_ends(text: &str) -> impl Iterator<Item = usize> {
     text.match_indices('.').filter_map(move |(at, _)| {
-        let rest = text[at + 1..]
-            .trim_start_matches(['¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁰'])
-            .trim_start_matches('*');
+        let rest =
+            text[at + 1..].trim_start_matches(['¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁰']);
+        let rest = rest.strip_prefix("**").unwrap_or(rest);
         rest.strip_prefix(' ').map(|after| text.len() - after.len())
     })
 }
@@ -1042,7 +1042,8 @@ mod tests {
 
     #[test]
     fn a_sentence_end_inside_bold_or_after_a_footnote_marker_anchors_mid_line() {
-        let first = "**1 Fabricated aim for a test entity.¹** 2 This rule asks for fabricated words.";
+        let first =
+            "**1 Fabricated aim for a test entity.¹** 2 This rule asks for fabricated words.";
         let third = "**3 Fabricated scope words.** 4 To meet it, an entity shall add words.";
         let pages = [page(
             1,
