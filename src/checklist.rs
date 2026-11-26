@@ -371,7 +371,7 @@ mod tests {
                 .unwrap();
         }
         let pages = crate::document_pages(&connection, &sha).unwrap();
-        crate::insert_paragraphs(&connection, &sha, &pages).unwrap();
+        crate::insert_paragraphs(&connection, &sha, &pages, None).unwrap();
         let found = checklist(&connection, &sha).unwrap();
         let labels: Vec<_> = found["requirements"]
             .as_array()
