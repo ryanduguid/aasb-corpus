@@ -343,19 +343,18 @@ fn page_lines<'a>(pages: &'a [Page], readings: Option<&'a [String]>) -> Vec<Line
 /// How many of a paragraph's first words must match to place a recovered label.
 const RECOVERY_WORDS: usize = 6;
 
-/// Labels that extraction lost but the second reader prints at a paragraph start: the PDF
-/// sets the number in a margin the extractor drops, or in a column it gives before the
-/// text, as `B25\n\nB26\n\n...` above every paragraph body. Each is the label, its line
-/// index on the page and the byte offset there where its paragraph's text starts, placed
-/// only where the reader's first words after the label start a line, follow a sentence end
-/// or follow closing bold exactly once on the page, and only for a label that starts no
-/// line, sentence or table row on the page already.
-fn recovered_labels<'a>(page: &'a Page, reading: &'a str) -> Vec<(usize, usize, &'a str)> {
-    if front_matter(page) {
-        return Vec::new();
-    }
-    let texts: Vec<&str> = page.text.lines().collect();
-    let present: HashSet<&str> = texts
+/// The first `RECOVERY_WORDS` words from byte `at` of line `index`, read on into later lines.
+fn first_words(lines: &[&str], index: usize, at: usize) -> Vec<String> {
+    std::iter::once(&lines[index][at..])
+        .chain(lines[index + 1..].iter().copied())
+        .flat_map(tokens)
+        .take(RECOVERY_WORDS)
+        .collect()
+}
+
+/// Every label that starts a line, a sentence or a table row in `lines`.
+fn page_labels<'a>(lines: &[&'a str]) -> HashSet<&'a str> {
+    lines
         .iter()
         .flat_map(|line| {
             label_at(line)
@@ -363,11 +362,15 @@ fn recovered_labels<'a>(page: &'a Page, reading: &'a str) -> Vec<(usize, usize, 
                 .chain(sentence_labels(line).map(|(_, label, _)| label))
                 .chain(table_label(line).map(|(label, _)| label))
         })
-        .collect();
-    let first_words =
-        |text: &str| -> Vec<String> { tokens(text).into_iter().take(RECOVERY_WORDS).collect() };
+        .collect()
+}
+
+/// Where unlabelled paragraph text can start on a page: a line start, after a sentence end
+/// or after closing bold, with no label there. Each is the line index, the byte offset and
+/// the first words from it.
+fn paragraph_starts(lines: &[&str]) -> Vec<(usize, usize, Vec<String>)> {
     let mut starts = Vec::new();
-    for (index, line) in texts.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
         if footer(line) || reference_footnote(line) {
             continue;
         }
@@ -376,16 +379,35 @@ fn recovered_labels<'a>(page: &'a Page, reading: &'a str) -> Vec<(usize, usize, 
             .chain(sentence_ends(line).map(|(at, _)| at))
             .chain(bold);
         for at in offsets {
-            let rest = [&line[at..]]
-                .into_iter()
-                .chain(texts[index + 1..].iter().copied())
-                .collect::<Vec<_>>()
-                .join("\n");
             if !line[at..].trim().is_empty() && label_at(&line[at..]).is_none() {
-                starts.push((index, at, first_words(&rest)));
+                starts.push((index, at, first_words(lines, index, at)));
             }
         }
     }
+    starts
+}
+
+/// Labels that extraction lost but the second reader prints at a paragraph start: the PDF
+/// sets the number in a margin the extractor drops, or in a column it gives before the
+/// text, as `B25`, `B26` and so on, each alone on a line, above the bodies. Each is the
+/// line index on the page, the byte offset there where its paragraph's text starts and the
+/// label, placed only
+/// where the reader's first words after the label start a line, follow a sentence end or
+/// follow closing bold exactly once on the page, and only for a label that starts no line,
+/// sentence or table row on the page already and one line in the reading.
+fn recovered_labels<'a>(
+    page: &'a Page,
+    readings: Option<&'a [String]>,
+) -> Vec<(usize, usize, &'a str)> {
+    let Some(reading) = readings.and_then(|r| r.get((page.page as usize).checked_sub(1)?)) else {
+        return Vec::new();
+    };
+    if front_matter(page) {
+        return Vec::new();
+    }
+    let texts: Vec<&str> = page.text.lines().collect();
+    let present = page_labels(&texts);
+    let starts = paragraph_starts(&texts);
     let reading_lines: Vec<&str> = reading.lines().collect();
     let labels: Vec<_> = reading_lines.iter().filter_map(|l| label_at(l)).collect();
     let mut found = Vec::new();
@@ -393,20 +415,14 @@ fn recovered_labels<'a>(page: &'a Page, reading: &'a str) -> Vec<(usize, usize, 
         let Some(label) = label_at(line) else {
             continue;
         };
-        let body = plain_start(&line[line.find(label).unwrap_or(0) + label.len()..]);
+        let after = line.find(label).unwrap_or(0) + label.len();
         if present.contains(label)
             || labels.iter().filter(|other| **other == label).count() != 1
-            || !body.starts_with(char::is_uppercase)
+            || !plain_start(&line[after..]).starts_with(char::is_uppercase)
         {
             continue;
         }
-        let words = first_words(
-            &[body]
-                .into_iter()
-                .chain(reading_lines[index + 1..].iter().copied())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        let words = first_words(&reading_lines, index, after);
         if words.len() < RECOVERY_WORDS {
             continue;
         }
@@ -418,6 +434,13 @@ fn recovered_labels<'a>(page: &'a Page, reading: &'a str) -> Vec<(usize, usize, 
     found.sort_unstable();
     found.dedup_by_key(|(line, at, _)| (*line, *at));
     found
+}
+
+/// A footer, a reference footnote or a label alone on a line, as in the column of labels
+/// that a recovered label replaces.
+fn not_text(line: &str, recovered: &[(usize, usize, &str)]) -> bool {
+    let bare = plain_start(line).trim_end_matches(['*', '_']).trim();
+    footer(line) || reference_footnote(line) || recovered.iter().any(|(_, _, l)| *l == bare)
 }
 
 /// The recovered label of line `index` at byte `start`, when it continues `current`'s series.
@@ -479,20 +502,12 @@ fn lines_with<'a>(
     for page in pages {
         let skip_page = front_matter(page);
         let texts: Vec<&str> = page.text.lines().collect();
-        let recovered = readings
-            .and_then(|readings| readings.get((page.page as usize).checked_sub(1)?))
-            .map_or_else(Vec::new, |reading| recovered_labels(page, reading));
+        let recovered = recovered_labels(page, readings);
         let (mut anchored_here, mut in_footnote) = (false, false);
         for (index, full) in texts.iter().copied().enumerate() {
             in_footnote =
                 in_footnote || (!skip_page && anchored_here && footnote_at(recent, &texts, index));
-            // A label alone on a line is the column a recovered label replaces.
-            let bare = plain_start(full).trim_end_matches(['*', '_']).trim();
-            let skip = skip_page
-                || in_footnote
-                || footer(full)
-                || reference_footnote(full)
-                || recovered.iter().any(|(_, _, label)| *label == bare);
+            let skip = skip_page || in_footnote || not_text(full, &recovered);
             let mut start = 0;
             loop {
                 let rest = &full[start..];
