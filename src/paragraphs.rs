@@ -529,6 +529,7 @@ fn lines_with<'a>(
                     .flatten();
                 let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
                 let text = &full[start..end];
+                let anchor = row.or_else(|| label_at(text).filter(|_| !skip));
                 lines.push(Line {
                     page,
                     number: index + 1,
@@ -536,10 +537,8 @@ fn lines_with<'a>(
                     start,
                     text,
                     skip,
-                    anchor: row
-                        .or_else(|| label_at(text).filter(|_| !skip))
-                        .or(restored),
-                    recovered: restored.is_some(),
+                    anchor: anchor.or(restored),
+                    recovered: anchor.is_none() && restored.is_some(),
                 });
                 match split {
                     Some(split) => start += split,
