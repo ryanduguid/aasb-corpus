@@ -10,13 +10,55 @@ use super::{
     QueryOptions, Result, catalogue, context_count, open, paragraph, search, verify_quote,
 };
 use serde_json::{Map, Value, json};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 /// The handshake revisions served, newest first.
 /// 2025-03-26 is left out: it requires accepting JSON-RPC batches, which this
 /// server refuses.
 const VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2024-11-05"];
+
+/// The longest request line read, in bytes. A longer line is refused unread past this.
+const MAX_LINE: usize = 1 << 20;
+
+/// One request line, or the sign that it was longer than the limit or stdin closed.
+enum Next {
+    Line,
+    TooLong,
+    End,
+}
+
+/// Reads the next line into `line` (cleared first), holding at most `limit` + 1 of its
+/// bytes. The rest of an over-long line is read and dropped without being stored.
+fn next_line(input: &mut impl BufRead, line: &mut Vec<u8>, limit: usize) -> std::io::Result<Next> {
+    line.clear();
+    let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    if (&mut *input).take(cap).read_until(b'\n', line)? == 0 {
+        return Ok(Next::End);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        return Ok(Next::Line);
+    }
+    if line.len() <= limit {
+        return Ok(Next::Line);
+    }
+    line.clear();
+    loop {
+        let buffer = input.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(Next::TooLong);
+        }
+        let (used, done) = buffer
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or((buffer.len(), false), |at| (at + 1, true));
+        input.consume(used);
+        if done {
+            return Ok(Next::TooLong);
+        }
+    }
+}
 
 fn tools() -> Value {
     let filters = json!({
@@ -57,7 +99,7 @@ fn tools() -> Value {
          "annotations": {"readOnlyHint": true, "openWorldHint": false}},
         {"name": "verify_aasb_quote",
          "description": "Grade a case-sensitive quotation against a captured PDF; verified is true only for an exact match on the named page.",
-         "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}, "quote": {"type": "string"}},
+         "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}, "quote": {"type": "string", "maxLength": 16384}},
                          "required": ["document_sha256", "quote"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "openWorldHint": false}}
     ])
@@ -221,10 +263,21 @@ fn reply(
 /// Serve requests from stdin until it closes.
 pub fn serve(root: &Path) -> Result<()> {
     let connection = open(root)?;
-    let stdin = std::io::stdin().lock();
+    let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    for line in stdin.split(b'\n') {
-        let line = line?;
+    let mut line = Vec::new();
+    loop {
+        match next_line(&mut stdin, &mut line, MAX_LINE)? {
+            Next::End => return Ok(()),
+            Next::TooLong => {
+                let response = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600,
+                    "message": "invalid request: a message line over 1 MiB is not read"}});
+                writeln!(stdout, "{response}")?;
+                stdout.flush()?;
+                continue;
+            }
+            Next::Line => {}
+        }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -259,5 +312,40 @@ pub fn serve(root: &Path) -> Result<()> {
         writeln!(stdout, "{response}")?;
         stdout.flush()?;
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn next(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Next {
+        next_line(reader, line, 1024).unwrap()
+    }
+
+    #[test]
+    fn an_over_long_line_is_refused_without_being_held() {
+        let long = vec![b'x'; 1 << 20];
+        let input = [&long[..], b"\n{\"short\":1}\nlast"].concat();
+        let mut reader = std::io::BufReader::with_capacity(64, &input[..]);
+        let mut line = Vec::new();
+        assert!(matches!(next(&mut reader, &mut line), Next::TooLong));
+        // At most the limit and one byte, with a vector's growth, is ever stored.
+        assert!(line.capacity() <= 2 * 1025, "{}", line.capacity());
+        assert!(matches!(next(&mut reader, &mut line), Next::Line));
+        assert_eq!(line, b"{\"short\":1}");
+        assert!(matches!(next(&mut reader, &mut line), Next::Line));
+        assert_eq!(line, b"last");
+        assert!(matches!(next(&mut reader, &mut line), Next::End));
+    }
+
+    #[test]
+    fn a_line_at_the_limit_is_read_and_one_byte_more_is_refused() {
+        let input = [vec![b'y'; 1024], b"\n".to_vec(), vec![b'z'; 1025]].concat();
+        let mut reader = &input[..];
+        let mut line = Vec::new();
+        assert!(matches!(next(&mut reader, &mut line), Next::Line));
+        assert_eq!(line.len(), 1024);
+        assert!(matches!(next(&mut reader, &mut line), Next::TooLong));
+        assert!(matches!(next(&mut reader, &mut line), Next::End));
+    }
 }

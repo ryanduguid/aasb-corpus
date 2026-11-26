@@ -586,6 +586,27 @@ fn mcp_refuses_paths_unknown_tools_and_malformed_requests() {
 }
 
 #[test]
+fn mcp_refuses_an_over_long_line_and_serves_the_next() {
+    let fixture = Fixture::new();
+    fixture.call("build", &[]);
+    let long = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"pad\":\"{}\"}}\n",
+        "x".repeat(3 << 20)
+    );
+    let input = long + &mcp_lines(&[json!({"jsonrpc":"2.0","id":2,"method":"ping"})]);
+    let (replies, stderr) = mcp_input(&fixture.0, &input);
+    assert_eq!(stderr, "");
+    assert_eq!(replies[0]["id"], Value::Null);
+    assert_eq!(replies[0]["error"]["code"], -32600);
+    assert_eq!(
+        replies[0]["error"]["message"],
+        "invalid request: a message line over 1 MiB is not read"
+    );
+    assert_eq!(replies[1], json!({"jsonrpc":"2.0","id":2,"result":{}}));
+    assert_eq!(replies.len(), 2);
+}
+
+#[test]
 fn mcp_needs_a_built_snapshot_before_serving() {
     let fixture = Fixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_aasb-corpus"))

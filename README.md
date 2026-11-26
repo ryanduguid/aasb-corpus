@@ -121,7 +121,7 @@ An index before schema 4 omits these fields. From schema 4, `verify` also re-der
 & .\target\release\aasb-corpus.exe verify-quote $snapshot $version 'quoted words'
 ```
 
-`verify-quote SNAPSHOT SHA256 [PAGE] QUOTE` grades a case-sensitive quotation against the indexed page text:
+`verify-quote SNAPSHOT SHA256 [PAGE] QUOTE` grades a case-sensitive quotation of up to 16,384 characters against the indexed page text; a longer one is refused before any page is read:
 
 - `exact`: the quotation's bytes appear unchanged in the page text.
 - `normalised`: it matches only under the tax corpus's Unicode compatibility rules or after collapsing whitespace.
@@ -138,7 +138,7 @@ Without PAGE the command searches every page of the selected PDF and lists up to
 & .\target\release\aasb-corpus.exe mcp $snapshot
 ```
 
-`mcp SNAPSHOT` serves 4 read-only tools over stdio, one JSON-RPC message a line: `search_aasb_pages`, `list_aasb_documents`, `read_aasb_paragraph` and `verify_aasb_quote`. It accepts the `initialize` handshake of MCP revisions 2025-11-25, 2025-06-18 and 2024-11-05, and refuses JSON-RPC batches, so it does not offer 2025-03-26, which requires them. Each takes the matching command's arguments by name (`document_sha256` for the PDF hash, `context` for `--context`, and `stem` and `paragraphs` as booleans) and returns the JSON that command prints, so the statuses and grades above apply unchanged. The snapshot is fixed at start-up and no tool takes a path; an argument a tool does not declare is refused. Once serving, the server writes nothing to stderr; a start-up failure, such as an unbuilt snapshot, is reported there before it exits. It makes no network request, but the MCP host sends tool results, page text included, to its model.
+`mcp SNAPSHOT` serves 4 read-only tools over stdio, one JSON-RPC message a line: `search_aasb_pages`, `list_aasb_documents`, `read_aasb_paragraph` and `verify_aasb_quote`. It accepts the `initialize` handshake of MCP revisions 2025-11-25, 2025-06-18 and 2024-11-05, and refuses JSON-RPC batches, so it does not offer 2025-03-26, which requires them. Each takes the matching command's arguments by name (`document_sha256` for the PDF hash, `context` for `--context`, and `stem` and `paragraphs` as booleans) and returns the JSON that command prints, so the statuses and grades above apply unchanged. The snapshot is fixed at start-up and no tool takes a path; an argument a tool does not declare is refused. A message line over 1 MiB is refused with an `invalid request` error and read no further than that; the server then serves the next line. Once serving, the server writes nothing to stderr; a start-up failure, such as an unbuilt snapshot, is reported there before it exits. It makes no network request, but the MCP host sends tool results, page text included, to its model.
 
 Other repositories can invoke this executable or read the SQLite database directly. Search connections are read-only. No consumer repository changes are needed to use the shared snapshot.
 
