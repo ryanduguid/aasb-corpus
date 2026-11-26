@@ -7,7 +7,8 @@
 //! refused. Nothing is written to stderr whilst serving, so no page text reaches
 //! a log.
 use super::{
-    QueryOptions, Result, catalogue, context_count, open, paragraph, search, verify_quote,
+    QueryOptions, Result, catalogue, checklist, context_count, open, page, paragraph, search,
+    stats, verify_quote,
 };
 use serde_json::{Map, Value, json};
 use std::io::{BufRead, Read, Write};
@@ -101,6 +102,25 @@ fn tools() -> Value {
          "description": "Grade a case-sensitive quotation against a captured PDF; verified is true only for an exact match on the named page.",
          "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}, "quote": {"type": "string", "maxLength": 16384}},
                          "required": ["document_sha256", "quote"], "additionalProperties": false},
+         "annotations": {"readOnlyHint": true, "openWorldHint": false}},
+        {"name": "read_aasb_page",
+         "description": "Return the indexed text of one physical page of a captured PDF, with its provenance and review flag.",
+         "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}},
+                         "required": ["document_sha256", "page"], "additionalProperties": false},
+         "annotations": {"readOnlyHint": true, "openWorldHint": false}},
+        {"name": "get_aasb_stats",
+         "description": "Count the snapshot's documents, pages, paragraphs and pages needing review.",
+         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+         "annotations": {"readOnlyHint": true, "openWorldHint": false}},
+        {"name": "list_aasb_s2_requirements",
+         "description": "List the disclosure requirements of one AASB S2 PDF from its stored paragraphs, with the gap analysis shape to fill in.",
+         "inputSchema": {"type": "object", "properties": {"document_sha256": document},
+                         "required": ["document_sha256"], "additionalProperties": false},
+         "annotations": {"readOnlyHint": true, "openWorldHint": false}},
+        {"name": "check_aasb_gap_analysis",
+         "description": "Check that a filled-in gap analysis answers every AASB S2 requirement in the agreed shape; it does not check that a quote is in the report.",
+         "inputSchema": {"type": "object", "properties": {"document_sha256": document, "result": {"type": "object", "description": "The gap analysis, shaped as list_aasb_s2_requirements' result_schema"}},
+                         "required": ["document_sha256", "result"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "openWorldHint": false}}
     ])
 }
@@ -171,6 +191,22 @@ fn read_paragraph(root: &Path, connection: &rusqlite::Connection, call: &Value) 
     )
 }
 
+/// `check_aasb_gap_analysis`: the gap analysis arrives as an object argument, not a path.
+fn gap_analysis(connection: &rusqlite::Connection, call: &Value) -> Result<Value> {
+    let mut call = call.clone();
+    let result = call
+        .get_mut("arguments")
+        .and_then(Value::as_object_mut)
+        .and_then(|a| a.remove("result"));
+    let a = arguments(&call, &["document_sha256"], &[], &[])?;
+    let sha = required(&a, "document_sha256")?;
+    match result {
+        Some(result @ Value::Object(_)) => checklist::gap_check_value(connection, sha, &result),
+        Some(_) => Err("argument result has the wrong type".into()),
+        None => Err("missing argument: result".into()),
+    }
+}
+
 fn call_tool(
     root: &Path,
     connection: &rusqlite::Connection,
@@ -199,6 +235,24 @@ fn call_tool(
             &options(&arguments(call, &["standard", "version"], &PAGING, &[])?)?,
         ),
         "read_aasb_paragraph" => read_paragraph(root, connection, call),
+        "read_aasb_page" => {
+            let a = arguments(call, &["document_sha256"], &["page"], &[])?;
+            let number = a
+                .get("page")
+                .and_then(Value::as_u64)
+                .ok_or("missing argument: page")?;
+            let number = u32::try_from(number).map_err(|_| "page is too large")?;
+            page(connection, required(&a, "document_sha256")?, number)
+        }
+        "get_aasb_stats" => {
+            arguments(call, &[], &[], &[])?;
+            stats(connection)
+        }
+        "list_aasb_s2_requirements" => {
+            let a = arguments(call, &["document_sha256"], &[], &[])?;
+            checklist::checklist(connection, required(&a, "document_sha256")?)
+        }
+        "check_aasb_gap_analysis" => gap_analysis(connection, call),
         "verify_aasb_quote" => {
             let a = arguments(call, &["document_sha256", "quote"], &["page"], &[])?;
             let page = match a.get("page").and_then(Value::as_u64) {

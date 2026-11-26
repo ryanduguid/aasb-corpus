@@ -402,6 +402,8 @@ fn tool_calls(sha: &str) -> Vec<Value> {
             "verify_aasb_quote",
             json!({"document_sha256":sha,"page":1,"quote":"Fabricated cobalt"}),
         ),
+        ("read_aasb_page", json!({"document_sha256":sha,"page":1})),
+        ("get_aasb_stats", json!({})),
     ]
     .into_iter()
     .zip(3..)
@@ -472,7 +474,7 @@ fn mcp_tools_answer_as_the_commands_do() {
     let (replies, stderr) = mcp(&fixture.0, &requests);
     assert_eq!(stderr, "");
     let ids: Vec<Value> = replies.iter().map(|r| r["id"].clone()).collect();
-    assert_eq!(ids, (1..=6).map(|n| json!(n)).collect::<Vec<_>>());
+    assert_eq!(ids, (1..=8).map(|n| json!(n)).collect::<Vec<_>>());
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(replies[0]["result"]["capabilities"], json!({"tools":{}}));
     assert_eq!(
@@ -481,7 +483,11 @@ fn mcp_tools_answer_as_the_commands_do() {
             "search_aasb_pages",
             "list_aasb_documents",
             "read_aasb_paragraph",
-            "verify_aasb_quote"
+            "verify_aasb_quote",
+            "read_aasb_page",
+            "get_aasb_stats",
+            "list_aasb_s2_requirements",
+            "check_aasb_gap_analysis"
         ]
     );
     let commands = [
@@ -492,6 +498,8 @@ fn mcp_tools_answer_as_the_commands_do() {
         fixture.call("catalogue", &["--standard", "AASB 16"]),
         fixture.call("paragraph", &[&sha, "26"]),
         fixture.call("verify-quote", &[&sha, "1", "Fabricated cobalt"]),
+        fixture.call("page", &[&sha, "1"]),
+        fixture.call("stats", &[]),
     ];
     for (reply, command) in replies[2..].iter().zip(commands) {
         let result = &reply["result"];
@@ -503,6 +511,54 @@ fn mcp_tools_answer_as_the_commands_do() {
     }
     assert_eq!(replies[4]["result"]["structuredContent"]["status"], "found");
     assert_eq!(replies[5]["result"]["structuredContent"]["verified"], true);
+}
+
+#[test]
+fn mcp_s2_tools_refuse_another_standard_and_a_result_that_is_not_an_object() {
+    let fixture = Fixture::new();
+    fixture.call("build", &[]);
+    let sha = hash(&source("new"));
+    let requests: Vec<Value> = [
+        ("list_aasb_s2_requirements", json!({"document_sha256":sha})),
+        (
+            "check_aasb_gap_analysis",
+            json!({"document_sha256":sha,"result":{"results":[]}}),
+        ),
+        (
+            "check_aasb_gap_analysis",
+            json!({"document_sha256":sha,"result":"/etc/passwd"}),
+        ),
+        ("check_aasb_gap_analysis", json!({"document_sha256":sha})),
+        ("get_aasb_stats", json!({"path":"/etc"})),
+        ("read_aasb_page", json!({"document_sha256":sha})),
+    ]
+    .into_iter()
+    .zip(1..)
+    .map(|((name, arguments), id)| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":name,"arguments":arguments}})
+    })
+    .collect();
+    let (replies, stderr) = mcp(&fixture.0, &requests);
+    assert_eq!(stderr, "");
+    let errors: Vec<_> = replies
+        .iter()
+        .map(|reply| {
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            reply["result"]["content"][0]["text"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "the document is not AASB S2",
+            "the document is not AASB S2",
+            "argument result has the wrong type",
+            "missing argument: result",
+            "unknown argument: path",
+            "missing argument: page"
+        ]
+    );
 }
 
 #[test]

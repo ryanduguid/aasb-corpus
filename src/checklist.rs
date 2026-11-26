@@ -224,9 +224,14 @@ pub(crate) fn checklist(connection: &Connection, sha: &str) -> Result<Value> {
 
 /// Checks the filled-in gap analysis in the file at `path` against the checklist for `sha`.
 pub(crate) fn gap_check(connection: &Connection, sha: &str, path: &str) -> Result<Value> {
-    let checklist = checklist(connection, sha)?;
     let result: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-    let problems = problems(&checklist, &result);
+    gap_check_value(connection, sha, &result)
+}
+
+/// Checks a filled-in gap analysis against the checklist for `sha`.
+pub(crate) fn gap_check_value(connection: &Connection, sha: &str, result: &Value) -> Result<Value> {
+    let checklist = checklist(connection, sha)?;
+    let problems = problems(&checklist, result);
     if !problems.is_empty() {
         let shown: Vec<_> = problems.iter().take(20).cloned().collect();
         return Err(format!(
