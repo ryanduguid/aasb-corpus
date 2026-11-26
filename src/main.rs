@@ -98,6 +98,10 @@ fn words(text: &str) -> Vec<String> {
 // Fewer consecutive words than this are too common to locate a quotation.
 const PARTIAL_MIN_WORDS: usize = 4;
 
+/// The longest quotation graded, in characters as the MCP schema's `maxLength` counts them.
+/// Grading costs page words times quotation words on every page searched.
+const MAX_QUOTE_CHARS: usize = 16_384;
+
 /// Grades a quotation against one page, strongest first: `exact` bytes; `normalised` under
 /// the compatibility rules or after collapsing whitespace; `partial` for the longest run of
 /// consecutive quotation words; otherwise `none`. Comparison stays case-sensitive.
@@ -1219,6 +1223,11 @@ fn verify_quote(
     number: Option<u32>,
     quote: &str,
 ) -> Result<Value> {
+    if quote.chars().count() > MAX_QUOTE_CHARS {
+        return Err(
+            "a quotation over 16,384 characters is not graded; quote a shorter passage".into(),
+        );
+    }
     let (aliases, metadata) = aliases_metadata(connection, sha)?;
     let mut pages = graded_pages(connection, sha, number, quote)?;
     let best = pages.iter().map(grade_rank).max().unwrap_or_default();
@@ -1658,6 +1667,23 @@ mod tests {
         }
         (root, connection, sha)
     }
+    #[test]
+    fn a_quotation_over_the_limit_is_refused_before_grading() {
+        let (root, connection, sha) = quote_fixture();
+        // Characters, not bytes: 16,384 two-byte characters are still graded.
+        let at_limit = "é".repeat(MAX_QUOTE_CHARS);
+        let graded = verify_quote(&root, &connection, &sha, Some(2), &at_limit).unwrap();
+        assert_eq!(graded["grade"], "none");
+        let over = "word ".repeat(MAX_QUOTE_CHARS / 5 + 1);
+        for page in [Some(2), None] {
+            let error = verify_quote(&root, &connection, &sha, page, &over).unwrap_err();
+            assert!(
+                error.to_string().contains("over 16,384 characters"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn only_exact_matches_on_a_named_native_page_are_verified() {
         let (root, connection, sha) = quote_fixture();
