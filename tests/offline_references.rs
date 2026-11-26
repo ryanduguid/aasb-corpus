@@ -366,7 +366,7 @@ fn every_command_makes_no_network_syscall() {
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
-            assert_eq!(replies.len(), 4);
+            assert_eq!(replies.len(), 6);
             assert!(
                 replies
                     .iter()
@@ -459,6 +459,10 @@ fn tool_names(reply: &Value) -> Vec<&str> {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "each tool's reply is compared with its command's output in one table"
+)]
 fn mcp_tools_answer_as_the_commands_do() {
     let fixture = Fixture::new();
     fixture.add_fabricated_reader_metadata();

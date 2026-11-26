@@ -83,7 +83,7 @@ fn tools() -> Value {
     );
     let document =
         json!({"type": "string", "description": "The document_sha256 of one captured PDF"});
-    json!([
+    let mut tools = json!([
         {"name": "search_aasb_pages",
          "description": "Rank pages of the captured AASB PDFs for a query, with physical page numbers and version metadata.",
          "inputSchema": {"type": "object", "properties": search_properties, "required": ["query"], "additionalProperties": false},
@@ -102,7 +102,17 @@ fn tools() -> Value {
          "description": "Grade a case-sensitive quotation against a captured PDF; verified is true only for an exact match on the named page.",
          "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}, "quote": {"type": "string", "maxLength": 16384}},
                          "required": ["document_sha256", "quote"], "additionalProperties": false},
-         "annotations": {"readOnlyHint": true, "openWorldHint": false}},
+         "annotations": {"readOnlyHint": true, "openWorldHint": false}}
+    ]);
+    if let Some(list) = tools.as_array_mut() {
+        list.extend(more_tools(&document));
+    }
+    tools
+}
+
+/// The page, stats and AASB S2 tools, which take only a document hash or nothing.
+fn more_tools(document: &Value) -> Vec<Value> {
+    let tools = json!([
         {"name": "read_aasb_page",
          "description": "Return the indexed text of one physical page of a captured PDF, with its provenance and review flag.",
          "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}},
@@ -122,7 +132,8 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"document_sha256": document, "result": {"type": "object", "description": "The gap analysis, shaped as list_aasb_s2_requirements' result_schema"}},
                          "required": ["document_sha256", "result"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "openWorldHint": false}}
-    ])
+    ]);
+    tools.as_array().cloned().unwrap_or_default()
 }
 
 /// The tool's arguments, refusing any it does not declare and any of the wrong type.
@@ -235,6 +246,27 @@ fn call_tool(
             &options(&arguments(call, &["standard", "version"], &PAGING, &[])?)?,
         ),
         "read_aasb_paragraph" => read_paragraph(root, connection, call),
+        "verify_aasb_quote" => {
+            let a = arguments(call, &["document_sha256", "quote"], &["page"], &[])?;
+            let page = match a.get("page").and_then(Value::as_u64) {
+                Some(page) => Some(u32::try_from(page).map_err(|_| "page is too large")?),
+                None => None,
+            };
+            verify_quote(
+                root,
+                connection,
+                required(&a, "document_sha256")?,
+                page,
+                required(&a, "quote")?,
+            )
+        }
+        _ => other_tool(connection, name, call),
+    }
+}
+
+/// Calls the page, stats and AASB S2 tools.
+fn other_tool(connection: &rusqlite::Connection, name: &str, call: &Value) -> Result<Value> {
+    match name {
         "read_aasb_page" => {
             let a = arguments(call, &["document_sha256"], &["page"], &[])?;
             let number = a
@@ -253,20 +285,6 @@ fn call_tool(
             checklist::checklist(connection, required(&a, "document_sha256")?)
         }
         "check_aasb_gap_analysis" => gap_analysis(connection, call),
-        "verify_aasb_quote" => {
-            let a = arguments(call, &["document_sha256", "quote"], &["page"], &[])?;
-            let page = match a.get("page").and_then(Value::as_u64) {
-                Some(page) => Some(u32::try_from(page).map_err(|_| "page is too large")?),
-                None => None,
-            };
-            verify_quote(
-                root,
-                connection,
-                required(&a, "document_sha256")?,
-                page,
-                required(&a, "quote")?,
-            )
-        }
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
