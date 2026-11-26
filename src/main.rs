@@ -321,9 +321,9 @@ fn insert_pages(
 type ParagraphRow = (i64, String, u32, bool, Value, String);
 
 /// Every anchored paragraph of one PDF as `build` stores it and `verify` re-derives it.
-fn paragraph_rows(pages: &[Page]) -> Result<Vec<ParagraphRow>> {
+fn paragraph_rows(pages: &[Page], readings: Option<&[String]>) -> Result<Vec<ParagraphRow>> {
     let mut rows = Vec::new();
-    for (ordinal, anchored) in paragraphs::index(pages).into_iter().enumerate() {
+    for (ordinal, anchored) in paragraphs::index(pages, readings).into_iter().enumerate() {
         let review = anchored.candidate["needs_review"] == true;
         rows.push((
             i64::try_from(ordinal)?,
@@ -338,12 +338,18 @@ fn paragraph_rows(pages: &[Page]) -> Result<Vec<ParagraphRow>> {
 }
 
 /// Stores every anchored paragraph with the candidate `paragraph` reports for it.
-fn insert_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Result<()> {
+/// `readings` is the second reader's text of each page, which places labels extraction lost.
+fn insert_paragraphs(
+    connection: &Connection,
+    sha: &str,
+    pages: &[Page],
+    readings: Option<&[String]>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "INSERT INTO paragraphs(document_sha256,ordinal,label,pdf_page,needs_review,candidate,text)
         VALUES (?1,?2,?3,?4,?5,?6,?7)",
     )?;
-    for (ordinal, label, page, review, candidate, text) in paragraph_rows(pages)? {
+    for (ordinal, label, page, review, candidate, text) in paragraph_rows(pages, readings)? {
         statement.execute(params![
             sha,
             ordinal,
@@ -393,7 +399,9 @@ fn index_document(
         ],
     )?;
     let pages = insert_pages(connection, document, &page_path)?;
-    insert_paragraphs(connection, &document.sha256, &pages)?;
+    let reading = second_reading(root, &document.sha256, pages.len())?;
+    let readings = reading.as_ref().map(|(_, texts)| texts.as_slice());
+    insert_paragraphs(connection, &document.sha256, &pages, readings)?;
     insert_citations(connection, &document.sha256, &metadata, &pages)?;
     Ok(u64::from(document.page_count))
 }
@@ -1252,7 +1260,12 @@ fn verify_quote(
 }
 
 /// The stored paragraphs must be exactly those the indexed pages yield today.
-fn check_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Result<()> {
+fn check_paragraphs(
+    connection: &Connection,
+    sha: &str,
+    pages: &[Page],
+    readings: Option<&[String]>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT ordinal,label,pdf_page,needs_review,candidate,text FROM paragraphs
         WHERE document_sha256=?1 ORDER BY ordinal",
@@ -1278,7 +1291,7 @@ fn check_paragraphs(connection: &Connection, sha: &str, pages: &[Page]) -> Resul
             text,
         ));
     }
-    if stored != paragraph_rows(pages)? {
+    if stored != paragraph_rows(pages, readings)? {
         return Err("paragraph table differs from the indexed pages; rebuild the index".into());
     }
     Ok(())
@@ -1296,7 +1309,9 @@ fn check_derived(root: &Path, connection: &Connection) -> Result<()> {
         .collect::<std::result::Result<_, _>>()?;
     for (sha, metadata) in documents {
         let pages = document_pages(connection, &sha)?;
-        check_paragraphs(connection, &sha, &pages)?;
+        let reading = second_reading(root, &sha, pages.len())?;
+        let readings = reading.as_ref().map(|(_, texts)| texts.as_slice());
+        check_paragraphs(connection, &sha, &pages, readings)?;
         if schema >= 4 {
             let metadata: Vec<Value> = serde_json::from_str(&metadata)?;
             let stored = connection
@@ -1546,7 +1561,7 @@ mod tests {
             provenance: "native".into(),
             needs_review: false,
         }];
-        let rows = paragraph_rows(&pages).unwrap();
+        let rows = paragraph_rows(&pages, None).unwrap();
         let (_, label, _, review, candidate, search) = &rows[0];
         assert_eq!(label, "35");
         assert!(review);
@@ -1796,7 +1811,7 @@ mod tests {
             .unwrap();
         for sha in documents {
             let pages = document_pages(connection, &sha).unwrap();
-            insert_paragraphs(connection, &sha, &pages).unwrap();
+            insert_paragraphs(connection, &sha, &pages, None).unwrap();
         }
     }
     #[test]

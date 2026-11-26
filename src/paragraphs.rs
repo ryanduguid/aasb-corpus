@@ -153,6 +153,8 @@ struct Line<'a> {
     skip: bool,
     /// The paragraph label this line starts, if it anchors one.
     anchor: Option<&'a str>,
+    /// True when the second reader, not the extracted text, supplies `anchor`.
+    recovered: bool,
 }
 
 /// Splits `C1 [Deleted by the AASB] AusC1.1 ...` after the marker when a label follows.
@@ -328,14 +330,149 @@ fn joined(fragments: &[Value]) -> String {
 /// first reading skips, such as page-foot footnotes, do not count. A label after a footnote
 /// marker or closing bold also needs no other start or row, and does not count against a
 /// label after a plain `. `: reproduced text can repeat a main-text label after bold.
-fn page_lines(pages: &[Page]) -> Vec<Line<'_>> {
-    let first = lines_with(pages, &label_starts(pages, &HashSet::new()));
+fn page_lines<'a>(pages: &'a [Page], readings: Option<&'a [String]>) -> Vec<Line<'a>> {
+    let first = lines_with(pages, &label_starts(pages, &HashSet::new()), readings);
     let skipped = first
         .iter()
         .filter(|line| line.skip)
         .map(|line| (line.page.page, line.number))
         .collect();
-    lines_with(pages, &label_starts(pages, &skipped))
+    lines_with(pages, &label_starts(pages, &skipped), readings)
+}
+
+/// How many of a paragraph's first words must match to place a recovered label.
+const RECOVERY_WORDS: usize = 6;
+
+/// The first `RECOVERY_WORDS` words from byte `at` of line `index`, read on into later lines.
+fn first_words(lines: &[&str], index: usize, at: usize) -> Vec<String> {
+    std::iter::once(&lines[index][at..])
+        .chain(lines[index + 1..].iter().copied())
+        .flat_map(tokens)
+        .take(RECOVERY_WORDS)
+        .collect()
+}
+
+/// Every label that starts a line, a sentence or a table row in `lines`.
+fn page_labels<'a>(lines: &[&'a str]) -> HashSet<&'a str> {
+    lines
+        .iter()
+        .flat_map(|line| {
+            label_at(line)
+                .into_iter()
+                .chain(sentence_labels(line).map(|(_, label, _)| label))
+                .chain(table_label(line).map(|(label, _)| label))
+        })
+        .collect()
+}
+
+/// Where unlabelled paragraph text can start on a page: a line start, after a sentence end
+/// or after closing bold, with no label there. Each is the line index, the byte offset and
+/// the first words from it.
+fn paragraph_starts(lines: &[&str]) -> Vec<(usize, usize, Vec<String>)> {
+    let mut starts = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if footer(line) || reference_footnote(line) {
+            continue;
+        }
+        let bold = line.match_indices("** ").map(|(at, _)| at + 3);
+        let offsets = std::iter::once(0)
+            .chain(sentence_ends(line).map(|(at, _)| at))
+            .chain(bold);
+        for at in offsets {
+            if !line[at..].trim().is_empty() && label_at(&line[at..]).is_none() {
+                starts.push((index, at, first_words(lines, index, at)));
+            }
+        }
+    }
+    starts
+}
+
+/// Labels that extraction lost but the second reader prints at a paragraph start: the PDF
+/// sets the number in a margin the extractor drops, or in a column it gives before the
+/// text, as `B25`, `B26` and so on, each alone on a line, above the bodies. Each is the
+/// line index on the page, the byte offset there where its paragraph's text starts and the
+/// label, placed only
+/// where the reader's first words after the label start a line, follow a sentence end or
+/// follow closing bold exactly once on the page, and only for a label that starts no line,
+/// sentence or table row on the page already and one line in the reading.
+fn recovered_labels<'a>(
+    page: &'a Page,
+    readings: Option<&'a [String]>,
+) -> Vec<(usize, usize, &'a str)> {
+    let Some(reading) = readings.and_then(|r| r.get((page.page as usize).checked_sub(1)?)) else {
+        return Vec::new();
+    };
+    if front_matter(page) {
+        return Vec::new();
+    }
+    let texts: Vec<&str> = page.text.lines().collect();
+    let present = page_labels(&texts);
+    let starts = paragraph_starts(&texts);
+    let reading_lines: Vec<&str> = reading.lines().collect();
+    let labels: Vec<_> = reading_lines.iter().filter_map(|l| label_at(l)).collect();
+    let mut found = Vec::new();
+    for (index, line) in reading_lines.iter().enumerate() {
+        let Some(label) = label_at(line) else {
+            continue;
+        };
+        let after = line.find(label).unwrap_or(0) + label.len();
+        if present.contains(label)
+            || labels.iter().filter(|other| **other == label).count() != 1
+            || !plain_start(&line[after..]).starts_with(char::is_uppercase)
+        {
+            continue;
+        }
+        let words = first_words(&reading_lines, index, after);
+        if words.len() < RECOVERY_WORDS {
+            continue;
+        }
+        let mut matches = starts.iter().filter(|(_, _, start)| *start == words);
+        if let (Some((line, at, _)), None) = (matches.next(), matches.next()) {
+            found.push((*line, *at, label));
+        }
+    }
+    found.sort_unstable();
+    found.dedup_by_key(|(line, at, _)| (*line, *at));
+    found
+}
+
+/// A footer, a reference footnote or a label alone on a line, as in the column of labels
+/// that a recovered label replaces.
+fn not_text(line: &str, recovered: &[(usize, usize, &str)]) -> bool {
+    let bare = plain_start(line).trim_end_matches(['*', '_']).trim();
+    footer(line) || reference_footnote(line) || recovered.iter().any(|(_, _, l)| *l == bare)
+}
+
+/// The recovered label of line `index` at byte `start`, when it continues `current`'s series.
+fn restored_at<'a>(
+    recovered: &[(usize, usize, &'a str)],
+    index: usize,
+    start: usize,
+    current: Option<&str>,
+) -> Option<&'a str> {
+    recovered
+        .iter()
+        .find(|(line, at, label)| {
+            *line == index && *at == start && current.is_none_or(|c| same_series(c, label))
+        })
+        .map(|(_, _, label)| *label)
+}
+
+/// The offset after `start` in line `index` of the next recovered label that continues
+/// `current`'s series. A page-foot footnote whose number extraction lost does not.
+fn next_restored(
+    recovered: &[(usize, usize, &str)],
+    index: usize,
+    start: usize,
+    current: Option<&str>,
+) -> Option<usize> {
+    recovered
+        .iter()
+        .filter(|(line, at, label)| {
+            *line == index && *at > start && current.is_none_or(|c| same_series(c, label))
+        })
+        .map(|(_, at, _)| at - start)
+        .min()
 }
 
 /// The byte offset in `text` of the first sentence label that follows `current` and anchors.
@@ -354,24 +491,30 @@ fn following(text: &str, current: &str, occurrences: &HashMap<&str, Starts>) -> 
         .map(|(at, _, _)| at)
 }
 
-fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec<Line<'a>> {
+fn lines_with<'a>(
+    pages: &'a [Page],
+    occurrences: &HashMap<&str, Starts>,
+    readings: Option<&'a [String]>,
+) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     // The last two anchored labels, the current one first.
     let mut recent: [Option<&str>; 2] = [None, None];
     for page in pages {
         let skip_page = front_matter(page);
         let texts: Vec<&str> = page.text.lines().collect();
+        let recovered = recovered_labels(page, readings);
         let (mut anchored_here, mut in_footnote) = (false, false);
         for (index, full) in texts.iter().copied().enumerate() {
             in_footnote =
                 in_footnote || (!skip_page && anchored_here && footnote_at(recent, &texts, index));
-            let skip = skip_page || in_footnote || footer(full) || reference_footnote(full);
+            let skip = skip_page || in_footnote || not_text(full, &recovered);
             let mut start = 0;
             loop {
                 let rest = &full[start..];
+                let restored = restored_at(&recovered, index, start, recent[0]).filter(|_| !skip);
                 // Table rows never split, so a row's label is always at its start.
                 let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip);
-                if let Some(label) = label_at(rest).filter(|_| !skip).or(row) {
+                if let Some(label) = label_at(rest).filter(|_| !skip).or(row).or(restored) {
                     recent = [Some(label), recent[0]];
                     anchored_here = true;
                 }
@@ -379,10 +522,14 @@ fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec
                     .then(|| {
                         after_deleted_marker(rest)
                             .or_else(|| following(rest, recent[0]?, occurrences))
+                            .into_iter()
+                            .chain(next_restored(&recovered, index, start, recent[0]))
+                            .min()
                     })
                     .flatten();
                 let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
                 let text = &full[start..end];
+                let anchor = row.or_else(|| label_at(text).filter(|_| !skip));
                 lines.push(Line {
                     page,
                     number: index + 1,
@@ -390,7 +537,8 @@ fn lines_with<'a>(pages: &'a [Page], occurrences: &HashMap<&str, Starts>) -> Vec
                     start,
                     text,
                     skip,
-                    anchor: row.or_else(|| label_at(text).filter(|_| !skip)),
+                    anchor: anchor.or(restored),
+                    recovered: anchor.is_none() && restored.is_some(),
                 });
                 match split {
                     Some(split) => start += split,
@@ -469,6 +617,11 @@ fn candidate(
 
 fn span_reasons(selected: &[Line<'_>]) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    if selected.first().is_some_and(|line| line.recovered) {
+        reasons.push(
+            "Extraction lost this label; the second reader places it. Read the source page to confirm.",
+        );
+    }
     if selected.windows(2).any(|pair| {
         pair[0].page.page != pair[1].page.page
             && pair[0].page.page.checked_add(1) != Some(pair[1].page.page)
@@ -559,8 +712,9 @@ pub(crate) struct Anchored {
 }
 
 /// Every anchored paragraph of one PDF in reading order, delimited as `lookup` delimits it.
-pub(crate) fn index(pages: &[Page]) -> Vec<Anchored> {
-    let lines = page_lines(pages);
+/// `readings` holds the second reader's text of each page, if the snapshot has it.
+pub(crate) fn index(pages: &[Page], readings: Option<&[String]>) -> Vec<Anchored> {
+    let lines = page_lines(pages, readings);
     let anchors: Vec<_> = lines
         .iter()
         .enumerate()
@@ -598,7 +752,7 @@ pub(crate) fn resolve(label: &str, candidates: Vec<Value>) -> Value {
 
 pub(crate) fn lookup(pages: &[Page], label: &str) -> Result<Value> {
     check_label(label)?;
-    let candidates = index(pages)
+    let candidates = index(pages, None)
         .into_iter()
         .filter(|anchored| anchored.label == label)
         .map(|anchored| anchored.candidate)
@@ -1330,5 +1484,167 @@ mod tests {
         assert_eq!(found["candidates"].as_array().unwrap().len(), 20);
         assert_eq!(found["candidates_truncated"], true);
         assert_eq!(found["status"], "ambiguous");
+    }
+
+    fn recovered(pages: &[Page], readings: &[String], label: &str) -> Value {
+        resolve(
+            label,
+            index(pages, Some(readings))
+                .into_iter()
+                .filter(|anchored| anchored.label == label)
+                .map(|anchored| anchored.candidate)
+                .collect(),
+        )
+    }
+
+    const LOST: &str =
+        "Extraction lost this label; the second reader places it. Read the source page to confirm.";
+
+    #[test]
+    fn second_reader_places_a_margin_label_extraction_dropped() {
+        // As AASB S2 (September 2024) paragraphs 22 and 29: the margin number is missing.
+        let pages = [
+            page(
+                1,
+                "21 An entity shall state the fabricated first requirement.\n",
+            ),
+            page(
+                2,
+                "# Fabricated resilience\n\nAn entity shall disclose fabricated resilience information for users.\n\n(a) the first part; and\n(b) the second part for the year ended 30 June 2025 fabricated words appear here.\n",
+            ),
+            page(3, "23 Fabricated next paragraph text here.\n"),
+        ];
+        let readings: Vec<String> = [
+            "AASB S2 1 STANDARD\n21 An entity shall state the fabricated first requirement.\n",
+            "AASB S2 2 STANDARD\nFabricated resilience\n22 An entity shall disclose fabricated resilience\ninformation for users.\n(a) the first part; and\n(b) the second part for the year ended\n30 June 2025 fabricated words appear here.\n",
+            "AASB S2 3 STANDARD\n23 Fabricated next paragraph text here.\n",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(lookup(&pages, "22").unwrap()["status"], "not_found");
+        let found = recovered(&pages, &readings, "22");
+        assert_eq!(found["status"], "needs_review");
+        let candidate = &found["candidates"][0];
+        assert_eq!(candidate["review_reasons"], json!([LOST]));
+        assert_eq!(candidate["next_paragraph"], "23");
+        assert_eq!(candidate["fragments"][0]["pdf_page"], 2);
+        assert_eq!(candidate["fragments"][0]["start_line"], 3);
+        assert!(
+            candidate["fragments"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("fabricated words appear here.")
+        );
+        let earlier = recovered(&pages, &readings, "21");
+        assert_eq!(earlier["status"], "found");
+        assert_eq!(earlier["candidates"][0]["next_paragraph"], "22");
+        // A date the reader wraps to a line start is not a paragraph.
+        assert_eq!(recovered(&pages, &readings, "30")["status"], "not_found");
+    }
+
+    /// As AASB S2 (December 2025) B20 to B31: the labels come first, the bodies after, and a
+    /// page-foot footnote's number is lost too.
+    fn column() -> ([Page; 3], Vec<String>) {
+        let pages = [
+            page(1, "B24 Fabricated earlier text applies.
+"),
+            page(
+                2,
+                "B25
+
+B26
+
+B27
+
+In some fabricated circumstances an entity discloses more.
+
+## Fabricated heading
+
+Paragraph 29(a) requires an entity to disclose the fabricated approach.
+**The fabricated approach set out** The Fabricated Protocol includes several approaches an entity might use.
+This is a fabricated footnote the reader numbers.
+",
+            ),
+            page(3, "B28 Fabricated later text applies.
+"),
+        ];
+        let readings = [
+            "B24 Fabricated earlier text applies.
+",
+            "B25 In some fabricated circumstances an entity
+discloses more.
+Fabricated heading
+B26 Paragraph 29(a) requires an entity to disclose the fabricated approach.
+The fabricated approach set out
+B27 The Fabricated Protocol includes several approaches an entity
+might use.
+4 This is a fabricated footnote the reader numbers.
+",
+            "B28 Fabricated later text applies.
+",
+        ]
+        .map(String::from)
+        .into();
+        (pages, readings)
+    }
+
+    #[test]
+    fn second_reader_places_labels_extraction_gave_as_a_column() {
+        let (pages, readings) = column();
+        let text = |label| {
+            let found = recovered(&pages, &readings, label);
+            assert_eq!(found["candidates"][0]["review_reasons"][0], LOST);
+            found["candidates"][0]["fragments"][0].clone()
+        };
+        assert_eq!(
+            text("B25")["text"],
+            "In some fabricated circumstances an entity discloses more."
+        );
+        assert_eq!(
+            text("B26")["text"],
+            "Paragraph 29(a) requires an entity to disclose the fabricated approach."
+        );
+        let b27 = text("B27");
+        assert_eq!(b27["start_column"], 37);
+        assert_eq!(
+            b27["text"],
+            "The Fabricated Protocol includes several approaches an entity might use.
+This is a fabricated footnote the reader numbers."
+        );
+    }
+
+    #[test]
+    fn a_label_column_is_skipped_and_a_lost_footnote_number_does_not_anchor() {
+        let (pages, readings) = column();
+        let labels = |readings| -> Vec<String> {
+            index(&pages, readings)
+                .into_iter()
+                .map(|anchored| anchored.label)
+                .collect()
+        };
+        assert_eq!(labels(Some(&readings)), ["B24", "B25", "B26", "B27", "B28"]);
+        // The column lines are skipped, so B24 keeps one fragment on its own page.
+        let earlier = recovered(&pages, &readings, "B24");
+        assert_eq!(earlier["status"], "found");
+        let fragments = earlier["candidates"][0]["fragments"].as_array().unwrap();
+        assert_eq!(fragments.len(), 1);
+        // Without the reading nothing is placed and the column stays text.
+        assert_eq!(labels(None), ["B24", "B28"]);
+    }
+
+    #[test]
+    fn a_label_already_on_the_page_or_an_ambiguous_start_is_not_recovered() {
+        let pages = [page(
+            1,
+            "5 Fabricated text one applies here today.\n\nFabricated repeated words start this line now.\n\nFabricated repeated words start this line now.\n",
+        )];
+        let readings: Vec<String> = vec![
+            "5 Fabricated text one applies here today.\n5 Fabricated text one applies here today.\n6 Fabricated repeated words start this line now.\n".into(),
+        ];
+        let labels: Vec<_> = index(&pages, Some(&readings))
+            .into_iter()
+            .map(|anchored| anchored.label)
+            .collect();
+        assert_eq!(labels, ["5"]);
     }
 }
