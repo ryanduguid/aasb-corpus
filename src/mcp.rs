@@ -10,7 +10,7 @@ use super::{
     QueryOptions, Result, catalogue, context_count, open, paragraph, search, verify_quote,
 };
 use serde_json::{Map, Value, json};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 /// The handshake revisions served, newest first.
@@ -33,7 +33,7 @@ enum Next {
 fn next_line(input: &mut impl BufRead, line: &mut Vec<u8>, limit: usize) -> std::io::Result<Next> {
     line.clear();
     let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
-    if input.by_ref().take(cap).read_until(b'\n', line)? == 0 {
+    if (&mut *input).take(cap).read_until(b'\n', line)? == 0 {
         return Ok(Next::End);
     }
     if line.last() == Some(&b'\n') {
