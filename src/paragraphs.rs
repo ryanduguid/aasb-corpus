@@ -1989,7 +1989,8 @@ This is a fabricated footnote the reader numbers."
             "Deleted IFRS S2 text\n22 Deleted IFRS S2 paragraph.\n".into(),
         ];
         let found = recovered(&pages, &readings, "22");
-        assert_eq!(found["status"], "needs_review");
+        assert_eq!(found["candidates"][0]["fragments"][0]["pdf_page"], 1);
+        assert_eq!(found["candidates"][0]["review_reasons"][0], LOST);
         assert_eq!(found["candidates"][0]["next_paragraph"], "23");
 
         let appendix_pages = [
@@ -2003,9 +2004,8 @@ This is a fabricated footnote the reader numbers."
             "28 Fabricated earlier paragraph.\n29 Fabricated lost paragraph twenty-nine at page foot.\n".into(),
             "B1 Fabricated appendix.\n29 Appendix reuse.\n".into(),
         ];
-        assert_eq!(
-            recovered(&appendix_pages, &appendix_readings, "29")["status"],
-            "needs_review"
-        );
+        let appendix = recovered(&appendix_pages, &appendix_readings, "29");
+        assert_eq!(appendix["candidates"][0]["fragments"][0]["pdf_page"], 1);
+        assert_eq!(appendix["candidates"][0]["review_reasons"][0], LOST);
     }
 }
