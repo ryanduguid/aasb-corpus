@@ -2,7 +2,8 @@
 
 <div align="center">
 
-[![tests](https://github.com/ryanduguid/aasb-corpus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ryanduguid/aasb-corpus/actions/workflows/ci.yml) [![CodeQL](https://github.com/ryanduguid/aasb-corpus/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/ryanduguid/aasb-corpus/actions/workflows/codeql.yml)<br>
+[![tests](https://github.com/ryanduguid/aasb-corpus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ryanduguid/aasb-corpus/actions/workflows/ci.yml) [![Codecov](https://codecov.io/gh/ryanduguid/aasb-corpus/graph/badge.svg)](https://codecov.io/gh/ryanduguid/aasb-corpus) [![CodeQL](https://github.com/ryanduguid/aasb-corpus/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/ryanduguid/aasb-corpus/actions/workflows/codeql.yml)<br>
+[![OpenSSF Scorecard](https://raw.githubusercontent.com/ryanduguid/.github/badges/ryanduguid/aasb-corpus.svg)](https://scorecard.dev/viewer/?uri=github.com/ryanduguid/aasb-corpus)<br>
 [![licence: Apache-2.0](.github/assets/badges/licence.svg)](LICENSE)
 
 [Current local snapshot](#current-local-snapshot) · [Run](#run) · [Rebuild a new snapshot](#rebuild-a-new-snapshot) · [Checks](#checks) · [Reuse and licence](#reuse-and-licence)
