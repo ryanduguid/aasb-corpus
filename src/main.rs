@@ -529,17 +529,17 @@ fn document_facts(connection: &Connection, sha: &str) -> Result<Option<(Value, V
 
 const DERIVED_BOUNDARY: &str = "validity restates the catalogue's period text against its retrieval date (as_at); it does not decide which version applies to a reporting period. reporting_tier is what a catalogue title states, and null where no title states one. cited_by lists pages of other standards' documents whose text cites this standard and label; a citation names no version, and a range cites only its endpoints.";
 
+const CITED_BY: &str =
+    "SELECT c.citing_document_sha256,c.pdf_page,c.line,c.kind,d.metadata FROM citations c
+        JOIN documents d ON d.sha256=c.citing_document_sha256
+        WHERE c.cited_standard IN (SELECT value FROM json_each(?1)) AND c.cited_label=?2
+        ORDER BY c.kind,c.citing_document_sha256,c.pdf_page,c.line";
+
 /// The pages of other documents whose text cites `label` of this document's standard,
 /// grouped by the citing document's kind; at most 20 of each kind.
 fn cited_by(connection: &Connection, metadata: &[Value], label: &str) -> Result<Value> {
     let keys = standard_keys(metadata);
-    let attempt = connection.prepare(
-        "SELECT c.citing_document_sha256,c.pdf_page,c.line,c.kind,d.metadata FROM citations c
-        JOIN documents d ON d.sha256=c.citing_document_sha256
-        WHERE c.cited_standard IN (SELECT value FROM json_each(?1)) AND c.cited_label=?2
-        ORDER BY c.kind,c.citing_document_sha256,c.pdf_page,c.line",
-    );
-    let mut statement = attempt?;
+    let mut statement = connection.prepare(CITED_BY)?;
     let mut groups: BTreeMap<&str, Vec<Value>> = [
         "interpretation",
         "agenda_decision",
@@ -1891,6 +1891,10 @@ mod tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture walks each way a second reading can be stale, in sequence"
+    )]
     fn paragraph_lookup_requires_an_unchanged_second_reading() {
         let (root, connection, sha) = paragraph_fixture();
         let source_manifest = root.join("source/manifest.json");

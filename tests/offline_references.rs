@@ -1098,6 +1098,10 @@ fn gap_answer(checklist: &Value, sha: &str) -> Value {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one S2 fixture answers the command and the tool in sequence"
+)]
 fn the_gap_check_command_and_tool_accept_a_complete_answer_and_refuse_the_rest() {
     let (fixture, sha) = s2_fixture();
     let root = fixture.0.to_str().unwrap();
