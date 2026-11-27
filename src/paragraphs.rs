@@ -522,6 +522,92 @@ fn following(text: &str, current: &str, occurrences: &HashMap<&str, Starts>) -> 
         .map(|(at, _, _)| at)
 }
 
+/// True when `index` at byte `at` is a plain-number line at the foot of a page that already
+/// anchored a paragraph, preceded by body text and followed only by wrapped lines or running text.
+fn at_page_foot(anchored_here: bool, texts: &[&str], index: usize, at: usize, label: &str) -> bool {
+    let running =
+        |line: &str| footer(line) || (heading(line) && plain_start(line).starts_with("AASB "));
+    at == 0
+        && anchored_here
+        && label.bytes().all(|b| b.is_ascii_digit())
+        && texts[..index]
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty() && !running(line))
+            .is_some_and(|line| !heading(line))
+        && texts[index + 1..]
+            .iter()
+            .all(|line| running(line) || (!heading(line) && label_at(line).is_none()))
+}
+
+fn deleted_s2_text(page: &Page) -> bool {
+    page.text.lines().any(|line| {
+        let plain = plain_start(line).trim_end_matches(['*', '_']).trim();
+        plain.eq_ignore_ascii_case("Deleted IFRS S2 text")
+            || (plain.starts_with("AASB S2") && plain.ends_with("DELETED IFRS S2 TEXT"))
+    })
+}
+
+/// True when `label` appears on a later page in the same series (before front-matter reset,
+/// `Deleted IFRS S2 text` or a series change/restart), either at a plain start or recovered.
+/// Ignores table rows (`|22|...|`) and bold-reproduced sentence starts (`** 22`).
+fn appears_later_in_series(
+    pages_after: &[Page],
+    recovered_after: &[Vec<(usize, usize, &str)>],
+    label: &str,
+) -> bool {
+    for (page, recovered) in pages_after.iter().zip(recovered_after) {
+        if front_matter(page) {
+            continue;
+        }
+        if deleted_s2_text(page) {
+            return false;
+        }
+        for (idx, line) in page.text.lines().enumerate() {
+            if footer(line) || reference_footnote(line) {
+                continue;
+            }
+            for later in label_at(line)
+                .into_iter()
+                .chain(
+                    sentence_labels(line)
+                        .filter(|(_, _, plain)| *plain)
+                        .map(|(_, l, _)| l),
+                )
+                .chain(
+                    recovered
+                        .iter()
+                        .filter(|(r, _, _)| *r == idx)
+                        .map(|(_, _, l)| *l),
+                )
+            {
+                if later == label {
+                    return true;
+                }
+                if !same_series(label, later) {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn next_split(
+    rest: &str,
+    index: usize,
+    start: usize,
+    current: Option<&str>,
+    occurrences: &HashMap<&str, Starts>,
+    recovered: &[(usize, usize, &str)],
+) -> Option<usize> {
+    after_deleted_marker(rest)
+        .or_else(|| following(rest, current?, occurrences))
+        .into_iter()
+        .chain(next_restored(recovered, index, start, current))
+        .min()
+}
+
 fn lines_with<'a>(
     pages: &'a [Page],
     occurrences: &HashMap<&str, Starts>,
@@ -530,34 +616,39 @@ fn lines_with<'a>(
     let mut lines = Vec::new();
     // The last two anchored labels, the current one first.
     let mut recent: [Option<&str>; 2] = [None, None];
-    for page in pages {
+    let all_recovered: Vec<_> = pages
+        .iter()
+        .map(|page| recovered_labels(page, readings))
+        .collect();
+    for (page_idx, page) in pages.iter().enumerate() {
         let skip_page = front_matter(page);
         let texts: Vec<&str> = page.text.lines().collect();
-        let mut recovered = recovered_labels(page, readings);
-        recovered.retain(|(_, _, label)| !occurrences.contains_key(label));
+        let recovered = &all_recovered[page_idx];
         let (mut anchored_here, mut in_footnote) = (false, false);
         for (index, full) in texts.iter().copied().enumerate() {
             in_footnote =
                 in_footnote || (!skip_page && anchored_here && footnote_at(recent, &texts, index));
-            let skip = skip_page || in_footnote || not_text(full, &recovered);
+            let skip = skip_page || in_footnote || not_text(full, recovered);
             let mut start = 0;
             loop {
                 let rest = &full[start..];
-                let restored = restored_at(&recovered, index, start, recent[0]).filter(|_| !skip);
-                // Table rows never split, so a row's label is always at its start.
+                let restored = restored_at(recovered, index, start, recent[0]).filter(|label| {
+                    !skip
+                        && !(at_page_foot(anchored_here, &texts, index, start, label)
+                            && appears_later_in_series(
+                                &pages[page_idx + 1..],
+                                &all_recovered[page_idx + 1..],
+                                label,
+                            ))
+                });
+                // Table rows can split on recovered labels, whilst a row's own label is at start == 0.
                 let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip && start == 0);
                 if let Some(label) = label_at(rest).filter(|_| !skip).or(row).or(restored) {
                     recent = [Some(label), recent[0]];
                     anchored_here = true;
                 }
                 let split = (!skip)
-                    .then(|| {
-                        after_deleted_marker(rest)
-                            .or_else(|| following(rest, recent[0]?, occurrences))
-                            .into_iter()
-                            .chain(next_restored(&recovered, index, start, recent[0]))
-                            .min()
-                    })
+                    .then(|| next_split(rest, index, start, recent[0], occurrences, recovered))
                     .flatten();
                 let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
                 let text = &full[start..end];
@@ -1754,17 +1845,17 @@ This is a fabricated footnote the reader numbers."
     fn table_row_does_not_anchor_after_a_split_inside_the_row() {
         let pages = [page(
             1,
-            "2 Fabricated earlier text.\n|4|Fabricated first cell text is long **and** Fabricated lost paragraph three starts right here.|\n",
+            "2 Fabricated earlier text.\n|4|Cell text **first** Lost paragraph three starts right here.** Lost paragraph three A starts right here.|\n",
         )];
         let readings: Vec<String> = vec![
-            "2 Fabricated earlier text.\n3 Fabricated lost paragraph three starts right here.\n"
+            "2 Fabricated earlier text.\n3 Lost paragraph three starts right here.\n3A Lost paragraph three A starts right here.\n"
                 .into(),
         ];
         let labels: Vec<_> = index(&pages, Some(&readings))
             .into_iter()
             .map(|anchored| anchored.label)
             .collect();
-        assert_eq!(labels, ["2", "3"]);
+        assert_eq!(labels, ["2", "3", "3A"]);
     }
 
     #[test]
@@ -1810,6 +1901,76 @@ This is a fabricated footnote the reader numbers."
         assert_eq!(
             recovered(&pages, &readings, "C1")["candidates"][0]["next_paragraph"],
             "C2"
+        );
+    }
+
+    #[test]
+    fn lost_footnote_is_suppressed_even_when_next_page_also_lost_its_label() {
+        let pages = [
+            page(
+                1,
+                "3 Fabricated paragraph three applies here.\nThis is a fabricated footnote the reader numbers.\n",
+            ),
+            page(
+                2,
+                "Fabricated real paragraph four continues on page two.\n5 Fabricated fifth paragraph.\n",
+            ),
+        ];
+        let readings: Vec<String> = vec![
+            "3 Fabricated paragraph three applies here.\n4 This is a fabricated footnote the reader numbers.\n".into(),
+            "4 Fabricated real paragraph four continues on page two.\n5 Fabricated fifth paragraph.\n".into(),
+        ];
+        let labels: Vec<_> = index(&pages, Some(&readings))
+            .into_iter()
+            .map(|anchored| anchored.label)
+            .collect();
+        assert_eq!(labels, ["3", "4", "5"]);
+        let four = recovered(&pages, &readings, "4");
+        assert_eq!(four["candidate_count"], 1);
+        assert_eq!(four["candidates"][0]["fragments"][0]["pdf_page"], 2);
+    }
+
+    #[test]
+    fn reused_labels_in_tables_bold_deleted_text_or_appendices_do_not_suppress_recovery() {
+        let pages = [
+            page(
+                1,
+                "21 Fabricated earlier paragraph.\n\nFabricated lost paragraph twenty-two at the foot of page one.\n",
+            ),
+            page(2, "COPYRIGHT\n22 Ignored notice clause.\n"),
+            page(
+                3,
+                "AASB S2 STANDARD\n23 Fabricated next paragraph.\n|22|Fabricated BC table row repeating number twenty-two.|\n23 Fabricated text.** 22 Reproduced bold sentence label.\n",
+            ),
+            page(
+                4,
+                "## Deleted IFRS S2 text\n22 Deleted IFRS S2 paragraph.\n",
+            ),
+        ];
+        let readings: Vec<String> = vec![
+            "21 Fabricated earlier paragraph.\n22 Fabricated lost paragraph twenty-two at the foot of page one.\n".into(),
+            "COPYRIGHT\n22 Ignored notice clause.\n".into(),
+            "23 Fabricated next paragraph.\n".into(),
+            "Deleted IFRS S2 text\n22 Deleted IFRS S2 paragraph.\n".into(),
+        ];
+        let found = recovered(&pages, &readings, "22");
+        assert_eq!(found["status"], "needs_review");
+        assert_eq!(found["candidates"][0]["next_paragraph"], "23");
+
+        let appendix_pages = [
+            page(
+                1,
+                "28 Fabricated earlier paragraph.\n\nFabricated lost paragraph twenty-nine at page foot.\n",
+            ),
+            page(2, "B1 Fabricated appendix.\n29 Appendix reuse.\n"),
+        ];
+        let appendix_readings = [
+            "28 Fabricated earlier paragraph.\n29 Fabricated lost paragraph twenty-nine at page foot.\n".into(),
+            "B1 Fabricated appendix.\n29 Appendix reuse.\n".into(),
+        ];
+        assert_eq!(
+            recovered(&appendix_pages, &appendix_readings, "29")["status"],
+            "needs_review"
         );
     }
 }
