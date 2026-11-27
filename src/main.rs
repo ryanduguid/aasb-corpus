@@ -1,3 +1,4 @@
+use aasb_corpus::{Page, parse_page};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,14 +41,6 @@ struct Document {
     page_count: u32,
     pages_sha256: String,
 }
-#[derive(Deserialize)]
-struct Page {
-    page: u32,
-    text: String,
-    provenance: String,
-    needs_review: bool,
-}
-
 fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -307,7 +300,7 @@ fn insert_pages(
     let mut pages = Vec::new();
     let mut expected = 1;
     for line in BufReader::new(File::open(page_path)?).lines() {
-        let page: Page = serde_json::from_str(&line?)?;
+        let page = parse_page(&line?)?;
         if page.page != expected {
             return Err("missing, duplicated or reordered page".into());
         }

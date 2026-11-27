@@ -1,0 +1,84 @@
+name: fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint the fuzz targets
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the channel and its clippy and rustfmt components.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # --locked also fails a stale fuzz/Cargo.lock.
+      - name: Check formatting and lint
+        run: |
+          cargo fmt --check --manifest-path fuzz/Cargo.toml
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pages_line, mcp_line]
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # libFuzzer instrumentation needs a nightly compiler; the date is pinned.
+      - name: Install the pinned nightly
+        run: rustup toolchain install nightly-2026-10-15 --profile minimal
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install the pinned fuzzer
+        run: cargo +nightly-2026-10-15 install cargo-fuzz --locked --version 0.13.2
+
+      # New inputs go to fuzz/corpus; the committed seeds in fuzz/seeds are only read.
+      - name: Fuzz for 60 seconds
+        run: >-
+          cargo +nightly-2026-10-15 fuzz run ${{ matrix.target }}
+          fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} --
+          -max_total_time=60 -max_len=4096 -timeout=2 -rss_limit_mb=1024
