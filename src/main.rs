@@ -1336,25 +1336,38 @@ fn check_derived(root: &Path, connection: &Connection) -> Result<()> {
         let reading = second_reading(root, &sha, pages.len())?;
         let readings = reading.as_ref().map(|(_, texts)| texts.as_slice());
         check_paragraphs(connection, &sha, &pages, readings)?;
-        if schema >= 4 {
-            let metadata: Vec<Value> = serde_json::from_str(&metadata)?;
-            let attempt = connection.prepare_cached(
-                "SELECT pdf_page,line,cited_standard,cited_label,kind FROM citations
-                WHERE citing_document_sha256=?1 ORDER BY id",
-            );
-            let stored = attempt?
-                .query_map([&sha], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })?
-                .collect::<std::result::Result<Vec<CitationRow>, _>>()?;
-            let derived = citation_rows(&metadata, &pages)?;
-            derived_matches(stored == derived)?;
-        }
+        let citations = if schema >= 4 {
+            check_citations(connection, &sha, &metadata, &pages)
+        } else {
+            Ok(())
+        };
+        citations?;
     }
     if schema >= 4 {
-        return check_facts(root, connection);
+        check_facts(root, connection)
+    } else {
+        Ok(())
     }
-    Ok(())
+}
+
+/// The stored citations of one document must be those its pages and metadata yield.
+fn check_citations(
+    connection: &Connection,
+    sha: &str,
+    metadata: &str,
+    pages: &[Page],
+) -> Result<()> {
+    let metadata: Vec<Value> = serde_json::from_str(metadata)?;
+    let attempt = connection.prepare_cached(
+        "SELECT pdf_page,line,cited_standard,cited_label,kind FROM citations
+        WHERE citing_document_sha256=?1 ORDER BY id",
+    );
+    let stored = attempt?
+        .query_map([sha], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<std::result::Result<Vec<CitationRow>, _>>()?;
+    derived_matches(stored == citation_rows(&metadata, pages)?)
 }
 
 /// The error for a stored paragraph, citation or fact that differs from what the pages give.

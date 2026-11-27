@@ -1217,3 +1217,19 @@ fn a_citation_from_another_version_of_the_same_standard_is_not_listed() {
     assert_eq!(found["candidate_count"], 1, "{found}");
     assert!(!found.to_string().contains(&a), "{found}");
 }
+
+#[test]
+fn an_index_of_an_older_schema_still_verifies() {
+    for version in [3, 2, 1] {
+        let fixture = citing_fixture();
+        rusqlite::Connection::open(fixture.0.join("index.sqlite3"))
+            .unwrap()
+            .execute_batch(&format!("PRAGMA user_version={version}"))
+            .unwrap();
+        assert_eq!(
+            fixture.call("verify", &[])["verified"],
+            true,
+            "schema {version}"
+        );
+    }
+}
