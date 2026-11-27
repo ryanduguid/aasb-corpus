@@ -618,15 +618,15 @@ fn appears_later_in_series(
         .unwrap_or(false)
 }
 
-struct PageTail<'a, 'b> {
+struct PageTail<'a, 'b, 'c> {
     texts: &'b [&'a str],
     recovered: &'b [(usize, usize, &'a str)],
     pages_after: &'a [Page],
     recovered_after: &'b [Vec<(usize, usize, &'a str)>],
-    occurrences: &'b HashMap<&'a str, Starts>,
+    occurrences: &'b HashMap<&'c str, Starts>,
 }
 
-impl<'a> PageTail<'a, '_> {
+impl<'a> PageTail<'a, '_, '_> {
     fn restored(
         &self,
         index: usize,
@@ -653,7 +653,7 @@ fn append_line_parts<'a>(
     page: &'a Page,
     index: usize,
     skip: bool,
-    tail: &PageTail<'a, '_>,
+    tail: &PageTail<'a, '_, '_>,
     anchored_here: &mut bool,
     recent: &mut [Option<&'a str>; 2],
     lines: &mut Vec<Line<'a>>,
@@ -696,7 +696,7 @@ fn append_page_lines<'a>(
     page_idx: usize,
     pages: &'a [Page],
     all_recovered: &[Vec<(usize, usize, &'a str)>],
-    occurrences: &HashMap<&'a str, Starts>,
+    occurrences: &HashMap<&str, Starts>,
     recent: &mut [Option<&'a str>; 2],
     lines: &mut Vec<Line<'a>>,
 ) {
