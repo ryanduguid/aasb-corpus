@@ -36,13 +36,23 @@ fn accompanying(label: &str) -> bool {
 
 /// How often `text` says 'shall disclose' or 'shall also disclose'.
 fn disclosures(text: &str) -> usize {
-    let words = text
+    let words: Vec<String> = text
         .replace(['*', '_'], "")
-        .to_lowercase()
         .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    words.matches("shall disclose").count() + words.matches("shall also disclose").count()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .filter(|w| *w == ["shall", "disclose"])
+        .count()
+        + words
+            .windows(3)
+            .filter(|w| *w == ["shall", "also", "disclose"])
+            .count()
 }
 
 /// A page of the deleted IFRS S2 text, which is not part of AASB S2: its heading or running
@@ -467,6 +477,17 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn disclosures_require_whole_words_not_substrings() {
+        assert_eq!(disclosures("An entity **shall\ndisclose**: risks."), 1);
+        assert_eq!(
+            disclosures("An entity shall also disclose, if material."),
+            1
+        );
+        assert_eq!(disclosures("Marshall discloses fabricated notes."), 0);
+        assert_eq!(disclosures("An entity shall disclosed nothing."), 0);
     }
 
     #[test]

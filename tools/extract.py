@@ -30,11 +30,19 @@ def check_pages(pages, expected):
 
 def extract(root):
     source = root / "source"
-    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    manifest_bytes = (source / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
     final = root / "extracted"
     stage = root / "extracted.partial"
     if final.exists() or stage.exists():
         raise ValueError("Extraction destination already exists; choose a new snapshot")
+    counts = {}
+    for entry in manifest["files"]:
+        count = entry.get("page_count")
+        if type(count) is not int or count < 1:
+            raise ValueError(f"Download manifest page_count is not a positive integer: {entry.get('filename')}")
+        if counts.setdefault(entry["sha256"], count) != count:
+            raise ValueError(f"Download manifest page_count conflicts for one SHA-256: {entry.get('filename')}")
     stage.mkdir()
     documents = {}
     review = []
@@ -94,9 +102,12 @@ def extract(root):
                               "pages": len(pages), "ocr_pages": len(needs_ocr)}), flush=True)
         except Exception as error:
             failures.append({"filename": name, "error": str(error)})
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    if digest(source / "manifest.json") != manifest_sha:
+        raise ValueError("Source manifest changed during extraction")
     receipt = {"schema_version": 1, "extractor": "pdf-inspector",
                "extractor_version": importlib.metadata.version("pdf-inspector"),
-               "source_manifest_sha256": digest(source / "manifest.json"),
+               "source_manifest_sha256": manifest_sha,
                "documents": list(documents.values()), "review_pages": review, "failures": failures}
     with (stage / "manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, indent=2)
@@ -104,7 +115,7 @@ def extract(root):
         stream.flush()
         os.fsync(stream.fileno())
     if failures:
-        raise ValueError(f"{len(failures)} documents failed; retained extraction.partial for inspection")
+        raise ValueError(f"{len(failures)} documents failed; retained extracted.partial for inspection")
     stage.rename(final)
     print(json.dumps({"documents": len(documents),
                       "pages": sum(row["page_count"] for row in documents.values()),
