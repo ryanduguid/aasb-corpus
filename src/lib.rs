@@ -1,6 +1,6 @@
-//! The 2 parsers that read untrusted bytes: a `pages.jsonl` line into [`Page`], and the
-//! MCP server's bounded request-line reader. The `aasb-corpus` binary uses them, and the
-//! fuzz targets in `fuzz/` exercise them.
+//! The 2 parsers that read untrusted bytes: [`Page`], whose derived `Deserialize` reads a
+//! `pages.jsonl` line, and the MCP server's bounded request-line reader. The `aasb-corpus`
+//! binary uses them, and the fuzz targets in `fuzz/` exercise them.
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read};
 
@@ -11,15 +11,6 @@ pub struct Page {
     pub text: String,
     pub provenance: String,
     pub needs_review: bool,
-}
-
-/// Parses one `pages.jsonl` line.
-///
-/// # Errors
-///
-/// When the line is not a JSON object with the 4 fields of [`Page`].
-pub fn parse_page(line: &str) -> serde_json::Result<Page> {
-    serde_json::from_str(line)
 }
 
 /// The longest request line read, in bytes. A longer line is refused unread past this.
@@ -110,8 +101,8 @@ mod tests {
     #[test]
     fn a_parsed_page_serialises_back_to_the_same_fields() {
         let line = r#"{"page":1,"text":"A fabricated lease liability","provenance":"native","needs_review":false}"#;
-        let page = parse_page(line).unwrap();
+        let page: Page = serde_json::from_str(line).unwrap();
         assert_eq!(serde_json::to_string(&page).unwrap(), line);
-        assert!(parse_page(r#"{"page":1}"#).is_err());
+        assert!(serde_json::from_str::<Page>(r#"{"page":1}"#).is_err());
     }
 }

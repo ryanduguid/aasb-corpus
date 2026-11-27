@@ -1,4 +1,3 @@
-use aasb_corpus::{Page, parse_page};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,6 +14,7 @@ use checklist::gap_check;
 mod derived;
 mod mcp;
 mod paragraphs;
+use aasb_corpus::Page;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -300,7 +300,7 @@ fn insert_pages(
     let mut pages = Vec::new();
     let mut expected = 1;
     for line in BufReader::new(File::open(page_path)?).lines() {
-        let page = parse_page(&line?)?;
+        let page: Page = serde_json::from_str(&line?)?;
         if page.page != expected {
             return Err("missing, duplicated or reordered page".into());
         }
