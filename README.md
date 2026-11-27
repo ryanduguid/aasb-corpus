@@ -2,7 +2,8 @@
 
 <div align="center">
 
-[![licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-66023C?labelColor=000000&style=flat&color=66023C)](LICENSE)
+[![tests](https://github.com/ryanduguid/aasb-corpus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ryanduguid/aasb-corpus/actions/workflows/ci.yml) [![CodeQL](https://github.com/ryanduguid/aasb-corpus/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/ryanduguid/aasb-corpus/actions/workflows/codeql.yml)<br>
+[![licence: Apache-2.0](.github/assets/badges/licence.svg)](LICENSE)
 
 [Current local snapshot](#current-local-snapshot) · [Run](#run) · [Rebuild a new snapshot](#rebuild-a-new-snapshot) · [Checks](#checks) · [Reuse and licence](#reuse-and-licence)
 
@@ -14,9 +15,7 @@ The installed pdf-inspector exposes its extraction and offline OCR through Pytho
 
 ## Current local snapshot
 
-Code: `C:\Users\-\Documents\Code\aasb-corpus`.
-
-Data: `C:\Users\-\Documents\AASB\corpus\2026-10-15-metadata-2026-11-21-schema-4`, the 15 October 2026 sources with the 21 November catalogue correction, built at schema 4 on 24 November 2026. The earlier indexes stay in `2026-10-15` and `2026-10-15-metadata-2026-11-21` so citations keep their digests; `2026-10-15-schema-4` rebuilds the original catalogue.
+Example snapshot: `<snapshot-dir>` (for example, `2026-10-15-metadata-2026-11-21-schema-4`, built from the 15 October 2026 sources with the 21 November catalogue correction at schema 4 on 24 November 2026). Earlier indexes stay in `2026-10-15` and `2026-10-15-metadata-2026-11-21` so citations keep their digests; `2026-10-15-schema-4` rebuilds the original catalogue.
 
 The snapshot preserves `source/`, its download manifest and `catalogue.json`. Extraction produces `extracted/<PDF SHA-256>/pages.jsonl` and `document.md`, plus an extraction manifest. Exact duplicate source files share one extraction; all original filename and URL aliases remain in the index. All source pages, including copyright notices and compilation information, remain in the extracted documents.
 
@@ -33,9 +32,9 @@ cargo build --locked --release
 Search locally:
 
 ```powershell
-& .\target\release\aasb-corpus.exe search 'C:\Users\-\Documents\AASB\corpus\2026-10-15' '"lease liability"'
-& .\target\release\aasb-corpus.exe stats 'C:\Users\-\Documents\AASB\corpus\2026-10-15'
-& .\target\release\aasb-corpus.exe verify 'C:\Users\-\Documents\AASB\corpus\2026-10-15'
+& .\target\release\aasb-corpus.exe search '<snapshot-dir>' '"lease liability"'
+& .\target\release\aasb-corpus.exe stats '<snapshot-dir>'
+& .\target\release\aasb-corpus.exe verify '<snapshot-dir>'
 ```
 
 `verify` also prints `index_sha256`, the digest of `index.sqlite3` to retain with any citation.
@@ -49,7 +48,7 @@ A stemmed search finds candidates; its results carry `stemmed` and `stem_boundar
 ### Choose a standard and PDF version
 
 ```powershell
-$snapshot = 'C:\Users\-\Documents\AASB\corpus\2026-10-15'
+$snapshot = '<snapshot-dir>'
 & .\target\release\aasb-corpus.exe catalogue $snapshot --standard 'AASB 16'
 & .\target\release\aasb-corpus.exe search $snapshot '"lease liability"' --standard 'AASB 16' --limit 5 --offset 0
 ```
@@ -144,15 +143,15 @@ Other repositories can invoke this executable or read the SQLite database direct
 
 ## Rebuild a new snapshot
 
-Copy the authorised PDFs, download manifest and catalogue into a new snapshot with the same layout. Extraction refuses an existing output directory:
+Copy the authorised PDFs, download manifest and catalogue into a new snapshot with the same layout, then run extraction and the second reader from the `pdf-inspector` Python environment before building with Cargo. Extraction refuses an existing output directory:
 
 ```powershell
-& 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 tools/extract.py 'C:\path\to\new-snapshot'
-& 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 tools/second_reader.py 'C:\path\to\new-snapshot'
-& .\target\release\aasb-corpus.exe build 'C:\path\to\new-snapshot'
+python -X utf8 tools/extract.py '<new-snapshot>'
+python -X utf8 tools/second_reader.py '<new-snapshot>'
+& .\target\release\aasb-corpus.exe build '<new-snapshot>'
 ```
 
-On the Linux sandbox, use `agent-run pdf-inspector-python tools/extract.py SNAPSHOT`. The extractor verifies source hashes, checks every page index, uses offline OCR only where pdf-inspector requests it and retains review flags. It stages extraction before renaming the completed folder. Indexing checks input hashes and complete document/page coverage, builds and checks FTS5 in one transaction, then promotes a new index. Failed stages are retained for inspection and never replace a completed snapshot.
+The extractor verifies source hashes, checks every page index, uses offline OCR only where pdf-inspector requests it and retains review flags. It stages extraction before renaming the completed folder. Indexing checks input hashes and complete document/page coverage, builds and checks FTS5 in one transaction, then promotes a new index. Failed stages are retained for inspection and never replace a completed snapshot.
 
 `tools/second_reader.py` stages its output and adds `second-reader/` to a snapshot; it refuses an existing output folder. Run it before `build`: the build places labels from it, so adding or changing it afterwards makes `verify` ask for a rebuild. A missing, unreadable or changed source file, a `page_count` in the source manifest that is not a positive integer or differs between entries with one SHA-256, or a source manifest that changes during the run, stops it with nothing promoted. Only a PDF whose verified bytes pypdf cannot read, or reads with a different page count, is listed under `failures` with its hash; its paragraphs report `found_unconfirmed`.
 
@@ -162,7 +161,7 @@ On the Linux sandbox, use `agent-run pdf-inspector-python tools/extract.py SNAPS
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-& 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 -m unittest discover -s tools -p 'test_*.py'
+python -X utf8 -m unittest discover -s tools -p 'test_*.py'
 ```
 
 ### Coverage gate
