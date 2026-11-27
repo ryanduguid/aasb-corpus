@@ -1775,7 +1775,7 @@ This is a fabricated footnote the reader numbers."
             ),
             page(
                 2,
-                "4 Fabricated real paragraph four applies for the 2025\nAmendments to AASB fabricated text continue here.\n105 Fabricated last main paragraph.\n",
+                "4 Fabricated real paragraph four applies for the 2025\nAmendments to AASB fabricated text continue here.\n5 Fabricated fifth paragraph.\n105 Fabricated last main paragraph.\n",
             ),
             page(
                 3,
@@ -1788,7 +1788,7 @@ This is a fabricated footnote the reader numbers."
         ];
         let readings: Vec<String> = vec![
             "3 Fabricated paragraph three applies here.\n4 This is a fabricated footnote the reader numbers.\n".into(),
-            "4 Fabricated real paragraph four applies for the\n2025 Amendments to AASB fabricated text continue here.\n105 Fabricated last main paragraph.\n".into(),
+            "4 Fabricated real paragraph four applies for the\n2025 Amendments to AASB fabricated text continue here.\n5 Fabricated fifth paragraph.\n105 Fabricated last main paragraph.\n".into(),
             "Appendix B\nB1 Fabricated appendix opening paragraph text applies here.\nB2 Fabricated second appendix paragraph.\n".into(),
             "B31 Fabricated last B paragraph.\nC1 Fabricated appendix C opening text applies here.\nC2 Fabricated second C paragraph.\n".into(),
         ];
@@ -1796,7 +1796,10 @@ This is a fabricated footnote the reader numbers."
             .into_iter()
             .map(|anchored| anchored.label)
             .collect();
-        assert_eq!(labels, ["3", "4", "105", "B1", "B2", "B31", "C1", "C2"]);
+        assert_eq!(
+            labels,
+            ["3", "4", "5", "105", "B1", "B2", "B31", "C1", "C2"]
+        );
         assert_eq!(recovered(&pages, &readings, "4")["status"], "found");
         assert_eq!(recovered(&pages, &readings, "2025")["status"], "not_found");
         assert_eq!(
