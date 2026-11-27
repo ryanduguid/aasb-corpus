@@ -1684,6 +1684,7 @@ This is a fabricated footnote the reader numbers."
         assert!(!follows("B1", "B"));
         assert!(!same_series("B", "B1"));
         assert!(!same_series("B1", "B"));
+        assert!(recovery_series(None, "1"));
         assert!(!recovery_series(Some("B"), "B1"));
         assert!(!recovery_series(Some("B1"), "B"));
     }
