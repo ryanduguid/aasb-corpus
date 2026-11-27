@@ -34,16 +34,20 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install
 
+      # The targets build against the versions the crate ships; Cargo adds only the
+      # fuzzer's own dependencies, so a bump to Cargo.lock never leaves a second lock stale.
+      - name: Start from the crate's lockfile
+        run: cp Cargo.lock fuzz/Cargo.lock
+
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # --locked also fails a stale fuzz/Cargo.lock.
       - name: Check formatting and lint
         run: |
           cargo fmt --check --manifest-path fuzz/Cargo.toml
-          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
   fuzz:
     name: fuzz ${{ matrix.target }}
@@ -66,6 +70,9 @@ jobs:
       # libFuzzer instrumentation needs a nightly compiler; the date is pinned.
       - name: Install the pinned nightly
         run: rustup toolchain install nightly-2026-10-15 --profile minimal
+
+      - name: Start from the crate's lockfile
+        run: cp Cargo.lock fuzz/Cargo.lock
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:

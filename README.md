@@ -190,6 +190,7 @@ On Linux, `! grep -E '^DA:[0-9]+,0$' lcov.info` replaces the `Select-String` lin
 `fuzz/` holds 2 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets over the parsers that read untrusted bytes: `pages_line` (a `pages.jsonl` line, which must parse back to the same page once serialised) and `mcp_line` (the MCP server's stdin, where a line over the 1 MiB limit must be refused before anything parses it). CI runs each for 60 seconds on every pull request and weekly. To run one locally on Linux with a nightly toolchain:
 
 ```sh
+cp Cargo.lock fuzz/Cargo.lock
 mkdir -p fuzz/corpus/mcp_line
 cargo +nightly fuzz run mcp_line fuzz/corpus/mcp_line fuzz/seeds/mcp_line -- -max_total_time=60
 ```
