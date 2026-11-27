@@ -459,10 +459,6 @@ mod tests {
                     {"id":"AASB S2|C|13","status":"not_satisfied","missing":"m"}]}),
                 "AASB S2|C|13 is answered more than once",
             ),
-            (
-                json!({"document_sha256":"ab","results":{}}),
-                "results must be an array",
-            ),
         ];
         for (result, expected) in cases {
             let found = problems(&checklist, &result);
@@ -474,14 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn non_array_or_missing_results_fails_even_when_requirements_are_empty() {
+    fn non_array_or_missing_results_fails_validation() {
+        let non_empty =
+            json!({"document_sha256":"ab","requirements":all_requirements("C", &sample())});
         let empty = json!({"document_sha256":"ab","requirements":[]});
-        for bad in [
-            json!({"document_sha256":"ab"}),
-            json!({"document_sha256":"ab","results":null}),
-            json!({"document_sha256":"ab","results":{}}),
-        ] {
-            assert_eq!(problems(&empty, &bad), ["results must be an array"]);
+        for checklist in [&empty, &non_empty] {
+            for bad in [
+                json!({"document_sha256":"ab"}),
+                json!({"document_sha256":"ab","results":null}),
+                json!({"document_sha256":"ab","results":{}}),
+            ] {
+                assert_eq!(problems(checklist, &bad), ["results must be an array"]);
+            }
         }
     }
 }
