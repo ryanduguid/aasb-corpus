@@ -540,14 +540,50 @@ fn at_page_foot(anchored_here: bool, texts: &[&str], index: usize, at: usize, la
             .all(|line| running(line) || (!heading(line) && label_at(line).is_none()))
 }
 
-fn section_reset_line(line: &str) -> bool {
-    let plain = plain_start(line).trim_end_matches(['*', '_']).trim();
+fn section_reset_line(prev: Option<&str>, line: &str) -> bool {
+    let trimmed = line.trim();
+    let plain = plain_start(trimmed).trim_end_matches(['*', '_']).trim();
     let lower = plain.to_ascii_lowercase();
-    (lower.starts_with("deleted ") && lower.ends_with(" text"))
-        || (lower.starts_with("aasb ") && lower.contains("deleted ") && lower.ends_with(" text"))
-        || plain
-            .strip_prefix("Appendix ")
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+    let marked = trimmed.starts_with('#')
+        || (trimmed.starts_with("**") && trimmed.ends_with("**"))
+        || (trimmed.starts_with('*') && trimmed.ends_with('*'));
+    let is_heading = (marked || prev.is_none_or(can_precede_paragraph))
+        && !plain.ends_with(['.', ',', ';', ':', ')', ']'])
+        && plain.split_whitespace().count() < 12;
+    let deleted = (lower.starts_with("deleted ") && lower.ends_with(" text"))
+        || (lower.starts_with("aasb ") && lower.contains("deleted ") && lower.ends_with(" text"));
+    let appendix = plain
+        .get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("appendix "))
+        && (marked
+            || plain[9..]
+                .split_whitespace()
+                .nth(1)
+                .is_none_or(|w| !w.starts_with(char::is_lowercase)));
+    is_heading && (deleted || appendix)
+}
+
+fn date_start(line: &str) -> bool {
+    plain_start(line)
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|month| {
+            matches!(
+                month.trim_end_matches([',', '.']),
+                "January"
+                    | "February"
+                    | "March"
+                    | "April"
+                    | "May"
+                    | "June"
+                    | "July"
+                    | "August"
+                    | "September"
+                    | "October"
+                    | "November"
+                    | "December"
+            )
+        })
 }
 
 fn series_moved_past(current: Option<&str>, label: &str, later: &str) -> bool {
@@ -558,6 +594,35 @@ fn series_moved_past(current: Option<&str>, label: &str, later: &str) -> bool {
                 || current.is_some_and(|c| !same_series(c, later))
                 || (!later.starts_with("Aus") && n_later > n_label)
         })
+}
+
+fn later_line_labels<'a>(
+    prev: Option<&str>,
+    line: &'a str,
+    idx: usize,
+    recovered: &[(usize, usize, &'a str)],
+) -> Vec<&'a str> {
+    let line_label = label_at(line).filter(|l| {
+        prev.is_none_or(can_precede_paragraph)
+            && !(l.bytes().all(|b| b.is_ascii_digit()) && date_start(line))
+    });
+    let mut on_line: Vec<(usize, &str)> = line_label
+        .map(|l| (0, l))
+        .into_iter()
+        .chain(
+            sentence_labels(line)
+                .filter(|(_, _, p)| *p)
+                .map(|(at, l, _)| (at, l)),
+        )
+        .chain(
+            recovered
+                .iter()
+                .filter(|(r, _, _)| *r == idx)
+                .map(|(_, at, l)| (*at, *l)),
+        )
+        .collect();
+    on_line.sort_unstable_by_key(|(at, _)| *at);
+    on_line.into_iter().map(|(_, l)| l).collect()
 }
 
 fn scan_later_page<'a>(
@@ -572,23 +637,15 @@ fn scan_later_page<'a>(
     let texts: Vec<&str> = page.text.lines().collect();
     let (mut recent, mut anchored, mut in_footnote) = ([None, None], false, false);
     for (idx, line) in texts.iter().copied().enumerate() {
-        if section_reset_line(line) {
+        let prev = idx.checked_sub(1).map(|i| texts[i]);
+        if section_reset_line(prev, line) {
             return Some(false);
         }
         in_footnote = in_footnote || (anchored && footnote_at(recent, &texts, idx));
         if in_footnote || footer(line) || reference_footnote(line) {
             continue;
         }
-        let line_label =
-            label_at(line).filter(|_| idx == 0 || can_precede_paragraph(texts[idx - 1]));
-        let plain_sent = sentence_labels(line)
-            .filter(|(_, _, plain)| *plain)
-            .map(|(_, l, _)| l);
-        let rec = recovered
-            .iter()
-            .filter(|(r, _, _)| *r == idx)
-            .map(|(_, _, l)| *l);
-        for later in line_label.into_iter().chain(plain_sent).chain(rec) {
+        for later in later_line_labels(prev, line, idx, recovered) {
             recent = [Some(later), recent[0]];
             anchored = true;
             if later == label {
@@ -2086,12 +2143,12 @@ This is a fabricated footnote the reader numbers."
             ),
             page(
                 2,
-                "Aus2.1 Fabricated Aus paragraph.\n3 Fabricated paragraph three.\n4 Fabricated real paragraph four.\n5 Fabricated fifth.\n",
+                "AASB 16 STANDARD\n1 January 2027.\nAppendix B sets out the requirements.\nAus2.1 Fabricated Aus paragraph.\n3 Fabricated paragraph three.\n4 Fabricated real paragraph four.\n5 Fabricated fifth.\n",
             ),
         ];
         let readings = [
             "2 Fabricated paragraph two applies here.\n4 This is a fabricated footnote the reader numbers.\n".into(),
-            "Aus2.1 Fabricated Aus paragraph.\n3 Fabricated paragraph three.\n4 Fabricated real paragraph four.\n5 Fabricated fifth.\n".into(),
+            "AASB 16 STANDARD\n1 January 2027.\nAppendix B sets out the requirements.\nAus2.1 Fabricated Aus paragraph.\n3 Fabricated paragraph three.\n4 Fabricated real paragraph four.\n5 Fabricated fifth.\n".into(),
         ];
         let labels: Vec<_> = index(&pages, Some(&readings))
             .into_iter()
