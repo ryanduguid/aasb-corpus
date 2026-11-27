@@ -608,6 +608,79 @@ fn next_split(
         .min()
 }
 
+fn foot_duplicate(
+    anchored_here: bool,
+    texts: &[&str],
+    index: usize,
+    start: usize,
+    label: &str,
+    pages_after: &[Page],
+    recovered_after: &[Vec<(usize, usize, &str)>],
+) -> bool {
+    at_page_foot(anchored_here, texts, index, start, label)
+        && appears_later_in_series(pages_after, recovered_after, label)
+}
+
+fn append_page_lines<'a>(
+    page_idx: usize,
+    pages: &'a [Page],
+    all_recovered: &[Vec<(usize, usize, &'a str)>],
+    occurrences: &HashMap<&str, Starts>,
+    recent: &mut [Option<&'a str>; 2],
+    lines: &mut Vec<Line<'a>>,
+) {
+    let page = &pages[page_idx];
+    let skip_page = front_matter(page);
+    let texts: Vec<&str> = page.text.lines().collect();
+    let recovered = &all_recovered[page_idx];
+    let (mut anchored_here, mut in_footnote) = (false, false);
+    for (index, full) in texts.iter().copied().enumerate() {
+        in_footnote =
+            in_footnote || (!skip_page && anchored_here && footnote_at(*recent, &texts, index));
+        let skip = skip_page || in_footnote || not_text(full, recovered);
+        let mut start = 0;
+        loop {
+            let rest = &full[start..];
+            let restored = restored_at(recovered, index, start, recent[0]).filter(|label| {
+                !skip
+                    && !foot_duplicate(
+                        anchored_here,
+                        &texts,
+                        index,
+                        start,
+                        label,
+                        &pages[page_idx + 1..],
+                        &all_recovered[page_idx + 1..],
+                    )
+            });
+            // Table rows can split on recovered labels, whilst a row's own label is at start == 0.
+            let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip && start == 0);
+            if let Some(label) = label_at(rest).filter(|_| !skip).or(row).or(restored) {
+                *recent = [Some(label), recent[0]];
+                anchored_here = true;
+            }
+            let split = (!skip)
+                .then(|| next_split(rest, index, start, recent[0], occurrences, recovered))
+                .flatten();
+            let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
+            let text = &full[start..end];
+            let anchor = row.or_else(|| label_at(text).filter(|_| !skip));
+            lines.push(Line {
+                page,
+                number: index + 1,
+                full,
+                start,
+                text,
+                skip,
+                anchor: anchor.or(restored),
+                recovered: anchor.is_none() && restored.is_some(),
+            });
+            let Some(split) = split else { break };
+            start += split;
+        }
+    }
+}
+
 fn lines_with<'a>(
     pages: &'a [Page],
     occurrences: &HashMap<&str, Starts>,
@@ -620,53 +693,15 @@ fn lines_with<'a>(
         .iter()
         .map(|page| recovered_labels(page, readings))
         .collect();
-    for (page_idx, page) in pages.iter().enumerate() {
-        let skip_page = front_matter(page);
-        let texts: Vec<&str> = page.text.lines().collect();
-        let recovered = &all_recovered[page_idx];
-        let (mut anchored_here, mut in_footnote) = (false, false);
-        for (index, full) in texts.iter().copied().enumerate() {
-            in_footnote =
-                in_footnote || (!skip_page && anchored_here && footnote_at(recent, &texts, index));
-            let skip = skip_page || in_footnote || not_text(full, recovered);
-            let mut start = 0;
-            loop {
-                let rest = &full[start..];
-                let restored = restored_at(recovered, index, start, recent[0]).filter(|label| {
-                    !skip
-                        && !(at_page_foot(anchored_here, &texts, index, start, label)
-                            && appears_later_in_series(
-                                &pages[page_idx + 1..],
-                                &all_recovered[page_idx + 1..],
-                                label,
-                            ))
-                });
-                // Table rows can split on recovered labels, whilst a row's own label is at start == 0.
-                let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip && start == 0);
-                if let Some(label) = label_at(rest).filter(|_| !skip).or(row).or(restored) {
-                    recent = [Some(label), recent[0]];
-                    anchored_here = true;
-                }
-                let split = (!skip)
-                    .then(|| next_split(rest, index, start, recent[0], occurrences, recovered))
-                    .flatten();
-                let end = split.map_or(full.len(), |split| full[..start + split].trim_end().len());
-                let text = &full[start..end];
-                let anchor = row.or_else(|| label_at(text).filter(|_| !skip));
-                lines.push(Line {
-                    page,
-                    number: index + 1,
-                    full,
-                    start,
-                    text,
-                    skip,
-                    anchor: anchor.or(restored),
-                    recovered: anchor.is_none() && restored.is_some(),
-                });
-                let Some(split) = split else { break };
-                start += split;
-            }
-        }
+    for page_idx in 0..pages.len() {
+        append_page_lines(
+            page_idx,
+            pages,
+            &all_recovered,
+            occurrences,
+            &mut recent,
+            &mut lines,
+        );
     }
     lines
 }
