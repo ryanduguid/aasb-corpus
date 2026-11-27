@@ -471,6 +471,10 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn non_array_or_missing_results_fails_even_when_requirements_are_empty() {
         let empty = json!({"document_sha256":"ab","requirements":[]});
         for bad in [
             json!({"document_sha256":"ab"}),

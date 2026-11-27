@@ -359,6 +359,34 @@ fn assert_no_network_commands(log: &str, cases: &[(Vec<&str>, String, Option<usi
     }
 }
 
+#[cfg(target_os = "linux")]
+fn check_s2_no_network(log: &str) {
+    let (s2, s2_sha) = s2_fixture();
+    let s2_root = s2.0.to_str().unwrap();
+    let checklist = s2.call("checklist", &[&s2_sha]);
+    let answer = gap_answer(&checklist, &s2_sha);
+    let answer_file = s2.0.join("answer.json");
+    fs::write(&answer_file, answer.to_string()).unwrap();
+    let s2_session = mcp_lines(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"list_aasb_s2_requirements","arguments":{"document_sha256":s2_sha}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"check_aasb_gap_analysis","arguments":{"document_sha256":s2_sha,"result":answer}}}),
+    ]);
+    assert_no_network_commands(
+        log,
+        &[
+            (vec!["checklist", s2_root, &s2_sha], String::new(), None),
+            (
+                vec!["gap-check", s2_root, &s2_sha, answer_file.to_str().unwrap()],
+                String::new(),
+                None,
+            ),
+            (vec!["mcp", s2_root], s2_session, Some(2)),
+        ],
+    );
+}
+
 /// README: 'No command uploads documents, calls a model provider or downloads
 /// content.' `strace -f` sees any network syscall, from any library or child
 /// process, on one run of every command. That proves these runs, not unexercised
@@ -394,31 +422,7 @@ fn every_command_makes_no_network_syscall() {
             (vec!["mcp", root], session, Some(6)),
         ],
     );
-
-    let (s2, s2_sha) = s2_fixture();
-    let s2_root = s2.0.to_str().unwrap();
-    let checklist = s2.call("checklist", &[&s2_sha]);
-    let answer = gap_answer(&checklist, &s2_sha);
-    let answer_file = s2.0.join("answer.json");
-    fs::write(&answer_file, answer.to_string()).unwrap();
-    let s2_session = mcp_lines(&[
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params":{"name":"list_aasb_s2_requirements","arguments":{"document_sha256":s2_sha}}}),
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"check_aasb_gap_analysis","arguments":{"document_sha256":s2_sha,"result":answer}}}),
-    ]);
-    assert_no_network_commands(
-        log,
-        &[
-            (vec!["checklist", s2_root, &s2_sha], String::new(), None),
-            (
-                vec!["gap-check", s2_root, &s2_sha, answer_file.to_str().unwrap()],
-                String::new(),
-                None,
-            ),
-            (vec!["mcp", s2_root], s2_session, Some(2)),
-        ],
-    );
+    check_s2_no_network(log);
 }
 
 /// One `tools/call` request per tool, ids 3 to 6, over the fabricated "new" PDF.
