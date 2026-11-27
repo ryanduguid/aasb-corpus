@@ -2006,6 +2006,6 @@ This is a fabricated footnote the reader numbers."
         ];
         let appendix = recovered(&appendix_pages, &appendix_readings, "29");
         assert_eq!(appendix["candidates"][0]["fragments"][0]["pdf_page"], 1);
-        assert_eq!(appendix["candidates"][0]["review_reasons"][0], LOST);
+        assert_eq!(appendix["candidates"][0]["review_reasons"][1], LOST);
     }
 }
