@@ -115,46 +115,59 @@ fn unlisted_pages(
         .collect()
 }
 
+fn check_entry<'a>(
+    entry: &'a Value,
+    wanted: &BTreeSet<&str>,
+    answered: &mut BTreeSet<&'a str>,
+    problems: &mut Vec<String>,
+) {
+    let filled = |field: &str| {
+        entry[field]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    let id = entry["id"].as_str().unwrap_or("(no id)");
+    if !wanted.contains(id) {
+        problems.push(format!("{id} is not in the checklist"));
+    }
+    if !answered.insert(id) {
+        problems.push(format!("{id} is answered more than once"));
+    }
+    match entry["status"].as_str() {
+        Some("satisfied") => {
+            for (field, name) in [("quote", "a quote"), ("location", "a location")] {
+                if !filled(field) {
+                    problems.push(format!("{id} is satisfied without {name}"));
+                }
+            }
+        }
+        Some("not_satisfied") if !filled("missing") => {
+            problems.push(format!("{id} is not satisfied without the missing element"));
+        }
+        Some("not_satisfied") => {}
+        other => problems.push(format!("{id} has status {}", other.unwrap_or("(none)"))),
+    }
+}
+
 /// Every way `result` departs from the gap-analysis schema for `checklist`.
 fn problems(checklist: &Value, result: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     if result["document_sha256"] != checklist["document_sha256"] {
         problems.push("document_sha256 differs from the checklist's document".to_owned());
     }
+    let Some(entries) = result["results"].as_array() else {
+        problems.push("results must be an array".to_owned());
+        return problems;
+    };
     let wanted: BTreeSet<&str> = checklist["requirements"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|r| r["id"].as_str())
         .collect();
-    let filled = |entry: &Value, field: &str| {
-        entry[field]
-            .as_str()
-            .is_some_and(|text| !text.trim().is_empty())
-    };
     let mut answered = BTreeSet::new();
-    for entry in result["results"].as_array().into_iter().flatten() {
-        let id = entry["id"].as_str().unwrap_or("(no id)");
-        if !wanted.contains(id) {
-            problems.push(format!("{id} is not in the checklist"));
-        }
-        if !answered.insert(id) {
-            problems.push(format!("{id} is answered more than once"));
-        }
-        match entry["status"].as_str() {
-            Some("satisfied") => {
-                for (field, name) in [("quote", "a quote"), ("location", "a location")] {
-                    if !filled(entry, field) {
-                        problems.push(format!("{id} is satisfied without {name}"));
-                    }
-                }
-            }
-            Some("not_satisfied") if !filled(entry, "missing") => {
-                problems.push(format!("{id} is not satisfied without the missing element"));
-            }
-            Some("not_satisfied") => {}
-            other => problems.push(format!("{id} has status {}", other.unwrap_or("(none)"))),
-        }
+    for entry in entries {
+        check_entry(entry, &wanted, &mut answered, &mut problems);
     }
     problems.extend(
         wanted
@@ -453,6 +466,22 @@ mod tests {
                 found.iter().any(|p| p.contains(expected)),
                 "{expected}: {found:?}"
             );
+        }
+    }
+
+    #[test]
+    fn non_array_or_missing_results_fails_validation() {
+        let non_empty =
+            json!({"document_sha256":"ab","requirements":all_requirements("C", &sample())});
+        let empty = json!({"document_sha256":"ab","requirements":[]});
+        for checklist in [&empty, &non_empty] {
+            for bad in [
+                json!({"document_sha256":"ab"}),
+                json!({"document_sha256":"ab","results":null}),
+                json!({"document_sha256":"ab","results":{}}),
+            ] {
+                assert_eq!(problems(checklist, &bad), ["results must be an array"]);
+            }
         }
     }
 }
