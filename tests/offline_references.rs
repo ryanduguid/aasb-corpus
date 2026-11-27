@@ -66,7 +66,12 @@ impl Fixture {
             .as_nanos();
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-data");
         fs::create_dir_all(&parent).unwrap();
-        let root = parent.join(format!("references-{}-{unique}", std::process::id()));
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = parent.join(format!(
+            "references-{}-{unique}-{count}",
+            std::process::id()
+        ));
         fs::create_dir(&root).unwrap();
         let fixture = Self(root);
         fs::create_dir(fixture.0.join("source")).unwrap();

@@ -1534,9 +1534,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-data")
-            .join(format!("{}-{unique}", std::process::id()));
+            .join(format!("{}-{unique}-{count}", std::process::id()));
         fs::create_dir_all(root.join("source")).unwrap();
         let content =
             b"Fabricated source bytes from the Croft Manor library for an index contract test";

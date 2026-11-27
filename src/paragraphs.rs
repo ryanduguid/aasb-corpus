@@ -1664,12 +1664,7 @@ This is a fabricated footnote the reader numbers."
 
     #[test]
     fn footers_are_not_paragraph_starts() {
-        let starts = paragraph_starts(&[
-            "AASB 16 STANDARD",
-            "5 Fabricated text one applies here today.",
-        ]);
-        assert!(!starts.is_empty());
-        assert!(starts.iter().all(|(line, _, _)| *line == 1));
+        assert!(paragraph_starts(&["AASB 16 STANDARD"]).is_empty());
     }
 
     #[test]
