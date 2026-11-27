@@ -14,6 +14,7 @@ use checklist::gap_check;
 mod derived;
 mod mcp;
 mod paragraphs;
+use aasb_corpus::Page;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -40,14 +41,6 @@ struct Document {
     page_count: u32,
     pages_sha256: String,
 }
-#[derive(Deserialize)]
-struct Page {
-    page: u32,
-    text: String,
-    provenance: String,
-    needs_review: bool,
-}
-
 fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()

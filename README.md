@@ -185,6 +185,16 @@ python -X utf8 -m coverage report --fail-under=100 -m
 
 On Linux, `! grep -E '^DA:[0-9]+,0$' lcov.info` replaces the `Select-String` line. The Python tests replace pdf-inspector with a fabricated module and need only `pypdf` besides `coverage`. `lcov.info` counts a line as unrun when no test reaches it; `cargo llvm-cov`'s own percentage also counts each closure that never runs on an otherwise covered line, so it can read a little under 100%.
 
+### Fuzzing
+
+`fuzz/` holds 2 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets over the parsers that read untrusted bytes: `pages_line` (a `pages.jsonl` line, which must parse back to the same page once serialised) and `mcp_line` (the MCP server's stdin, where a line over the 1 MiB limit must be refused before anything parses it). CI runs each for 60 seconds on every pull request and weekly. To run one locally on Linux with a nightly toolchain:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+mkdir -p fuzz/corpus/mcp_line
+cargo +nightly fuzz run mcp_line fuzz/corpus/mcp_line fuzz/seeds/mcp_line -- -max_total_time=60
+```
+
 The optional live-index check traverses filtered results and checks actual paragraph fragments against indexed page slices. On Linux, set `AASB_TEST_SNAPSHOT` to the local snapshot and run:
 
 ```sh
