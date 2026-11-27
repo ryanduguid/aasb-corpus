@@ -1993,19 +1993,28 @@ This is a fabricated footnote the reader numbers."
         assert_eq!(found["candidates"][0]["review_reasons"][0], LOST);
         assert_eq!(found["candidates"][0]["next_paragraph"], "23");
 
+        let p29 = "28 Fabricated earlier paragraph.\n\nFabricated lost paragraph twenty-nine at page foot.\n";
+        let r29 = "28 Fabricated earlier paragraph.\n29 Fabricated lost paragraph twenty-nine at page foot.\n";
         let appendix_pages = [
-            page(
-                1,
-                "28 Fabricated earlier paragraph.\n\nFabricated lost paragraph twenty-nine at page foot.\n",
-            ),
+            page(1, p29),
             page(2, "B1 Fabricated appendix.\n29 Appendix reuse.\n"),
         ];
         let appendix_readings = [
-            "28 Fabricated earlier paragraph.\n29 Fabricated lost paragraph twenty-nine at page foot.\n".into(),
+            r29.into(),
             "B1 Fabricated appendix.\n29 Appendix reuse.\n".into(),
         ];
         let appendix = recovered(&appendix_pages, &appendix_readings, "29");
         assert_eq!(appendix["candidates"][0]["fragments"][0]["pdf_page"], 1);
         assert_eq!(appendix["candidates"][0]["review_reasons"][1], LOST);
+
+        let tail_pages = [
+            page(1, p29),
+            page(2, "30 Fabricated thirtieth paragraph.\n"),
+        ];
+        let tail_readings = [r29.into(), "30 Fabricated thirtieth paragraph.\n".into()];
+        assert_eq!(
+            recovered(&tail_pages, &tail_readings, "29")["candidates"][0]["next_paragraph"],
+            "30"
+        );
     }
 }
