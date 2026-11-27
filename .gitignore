@@ -2,3 +2,5 @@
 /vendor/
 /data/
 __pycache__/
+/lcov.info
+.coverage

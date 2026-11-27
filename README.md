@@ -165,6 +165,19 @@ cargo clippy --locked --all-targets -- -D warnings
 & 'C:\Tools\pdf-inspector\.venv\Scripts\python.exe' -X utf8 -m unittest discover -s tools -p 'test_*.py'
 ```
 
+### Coverage gate
+
+The repository holds 100% line coverage for the Rust and the Python it keeps, with no excluded line. Run both commands before a change merges; each fails if one line goes unrun. Install [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and `coverage` once.
+
+```powershell
+cargo llvm-cov --locked --lcov --output-path lcov.info
+if (Select-String -Path lcov.info -Pattern '^DA:\d+,0$' -Quiet) { throw 'Rust lines are uncovered' }
+python -X utf8 -m coverage run --branch --source=tools -m unittest discover -s tools -p 'test_*.py'
+python -X utf8 -m coverage report --fail-under=100 -m
+```
+
+On Linux, `! grep -E '^DA:[0-9]+,0$' lcov.info` replaces the `Select-String` line. The Python tests replace pdf-inspector with a fabricated module and need only `pypdf` besides `coverage`. `lcov.info` counts a line as unrun when no test reaches it; `cargo llvm-cov`'s own percentage also counts each closure that never runs on an otherwise covered line, so it can read a little under 100%.
+
 The optional live-index check traverses filtered results and checks actual paragraph fragments against indexed page slices. On Linux, set `AASB_TEST_SNAPSHOT` to the local snapshot and run:
 
 ```sh
