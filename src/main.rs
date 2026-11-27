@@ -2141,9 +2141,10 @@ mod tests {
         fs::write(root.join(path), value.to_string()).unwrap();
         if path == "source/manifest.json" {
             let digest = file_hash(&root.join(path)).unwrap();
-            edit_json(root, "extracted/manifest.json", |m| {
-                m["source_manifest_sha256"] = json!(digest);
-            });
+            let record = root.join("extracted/manifest.json");
+            let mut extraction: Value = read_json(&record).unwrap();
+            extraction["source_manifest_sha256"] = json!(digest);
+            fs::write(record, extraction.to_string()).unwrap();
         }
     }
 

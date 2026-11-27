@@ -146,6 +146,3 @@ class ExtractTests(unittest.TestCase):
                 runpy.run_path(script, run_name="__main__")
             self.assertTrue((root / "extracted" / "manifest.json").exists())
 
-
-if __name__ == "__main__":
-    unittest.main()
