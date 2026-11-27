@@ -99,7 +99,7 @@ fn tools() -> Value {
                          "required": ["document_sha256", "label"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "openWorldHint": false}},
         {"name": "verify_aasb_quote",
-         "description": "Grade a case-sensitive quotation against a captured PDF; verified is true only for an exact match on the named page.",
+         "description": "Grade a case-sensitive quotation against a captured PDF; verified is true only for an exact match on the named page. A quotation over 2,048 words is refused.",
          "inputSchema": {"type": "object", "properties": {"document_sha256": document, "page": {"type": "integer", "minimum": 1}, "quote": {"type": "string", "maxLength": 16384}},
                          "required": ["document_sha256", "quote"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "openWorldHint": false}}

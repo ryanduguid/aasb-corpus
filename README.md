@@ -128,7 +128,7 @@ An index before schema 4 omits these fields. From schema 4, `verify` also re-der
 & .\target\release\aasb-corpus.exe verify-quote $snapshot $version 'quoted words'
 ```
 
-`verify-quote SNAPSHOT SHA256 [PAGE] QUOTE` grades a case-sensitive quotation of up to 16,384 characters against the indexed page text; a longer one is refused before any page is read:
+`verify-quote SNAPSHOT SHA256 [PAGE] QUOTE` grades a case-sensitive quotation of up to 16,384 characters and 2,048 words against the indexed page text; a longer one is refused before any page is read. An indexed page over 4,096 words (the 2026-10-15 snapshot's longest has 1,071) is refused rather than graded:
 
 - `exact`: the quotation's bytes appear unchanged in the page text.
 - `normalised`: it matches only under the tax corpus's Unicode compatibility rules or after collapsing whitespace.

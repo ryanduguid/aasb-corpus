@@ -102,6 +102,14 @@ const PARTIAL_MIN_WORDS: usize = 4;
 /// Grading costs page words times quotation words on every page searched.
 const MAX_QUOTE_CHARS: usize = 16_384;
 
+/// The longest quotation graded, in words: almost twice the 1,071 words of the 2026-10-15
+/// snapshot's longest page, which bounds any quotation that one page can hold.
+const MAX_QUOTE_WORDS: usize = 2_048;
+
+/// The longest page graded, in words: almost 4 times the 2026-10-15 snapshot's longest page.
+/// With `MAX_QUOTE_WORDS` it bounds one page's partial grading at about 8.4 million steps.
+const MAX_PAGE_WORDS: usize = 4_096;
+
 /// Grades a quotation against one page, strongest first: `exact` bytes; `normalised` under
 /// the compatibility rules or after collapsing whitespace; `partial` for the longest run of
 /// consecutive quotation words; otherwise `none`. Comparison stays case-sensitive.
@@ -110,10 +118,13 @@ fn grade_quote(quote: &str, text: &str) -> Result<Value> {
     if quote_words.is_empty() {
         return Err("a blank quotation is not valid".into());
     }
+    let page_words = words(text);
+    if page_words.len() > MAX_PAGE_WORDS {
+        return Err("an indexed page over 4,096 words is not graded; rebuild the index".into());
+    }
     if text.contains(quote) {
         return Ok(json!({"grade":"exact"}));
     }
-    let page_words = words(text);
     if literal(text).contains(&literal(quote))
         || page_words
             .windows(quote_words.len())
@@ -1242,6 +1253,9 @@ fn verify_quote(
             "a quotation over 16,384 characters is not graded; quote a shorter passage".into(),
         );
     }
+    if words(quote).len() > MAX_QUOTE_WORDS {
+        return Err("a quotation over 2,048 words is not graded; quote a shorter passage".into());
+    }
     let (aliases, metadata) = aliases_metadata(connection, sha)?;
     let mut pages = graded_pages(connection, sha, number, quote)?;
     let best = pages.iter().map(grade_rank).max().unwrap_or_default();
@@ -1732,6 +1746,45 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// `count` distinct 6-character words with the given first letter.
+    fn distinct_words(letter: char, count: usize) -> String {
+        (0..count).map(|n| format!("{letter}{n:05} ")).collect()
+    }
+
+    #[test]
+    fn a_quotation_over_2048_words_is_refused_before_grading() {
+        let (root, connection, sha) = quote_fixture();
+        let at_limit = "word ".repeat(MAX_QUOTE_WORDS);
+        let graded = verify_quote(&root, &connection, &sha, Some(2), &at_limit).unwrap();
+        assert_eq!(graded["grade"], "none");
+        let over = "word ".repeat(MAX_QUOTE_WORDS + 1);
+        for page in [Some(2), None] {
+            let error = verify_quote(&root, &connection, &sha, page, &over).unwrap_err();
+            assert!(error.to_string().contains("over 2,048 words"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_page_over_4096_words_is_refused() {
+        let at_limit = distinct_words('p', MAX_PAGE_WORDS);
+        assert_eq!(grade("p00000 p00001", &at_limit), "exact");
+        let over = distinct_words('p', MAX_PAGE_WORDS + 1);
+        let error = grade_quote("p00000 p00001", &over).unwrap_err();
+        assert!(error.to_string().contains("over 4,096 words"), "{error}");
+    }
+
+    #[test]
+    fn the_largest_accepted_grading_finishes_within_5_seconds() {
+        // Worst case: no exact or normalised match, so every page word meets every
+        // quotation word in the partial search; equal-length words force full comparisons.
+        let page = distinct_words('p', MAX_PAGE_WORDS);
+        let quote = distinct_words('q', MAX_QUOTE_WORDS);
+        let started = std::time::Instant::now();
+        assert_eq!(grade(&quote, &page), "none");
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]
