@@ -1152,12 +1152,24 @@ fn the_gap_check_command_and_tool_accept_a_complete_answer_and_refuse_the_rest()
             "check_aasb_gap_analysis",
             json!({"document_sha256":sha,"result":{"results":[]}}),
         ),
+        call(
+            7,
+            "read_aasb_page",
+            json!({"document_sha256":sha,"page":4_294_967_296_u64}),
+        ),
+        call(
+            8,
+            "verify_aasb_quote",
+            json!({"document_sha256":sha,"quote":"x","page":4_294_967_296_u64}),
+        ),
     ];
     // A blank line between messages is skipped, not answered.
     let (replies, stderr) = mcp_input(&fixture.0, &format!("  \n{}", mcp_lines(&requests)));
     assert_eq!(stderr, "");
-    assert_eq!(replies.len(), 6);
+    assert_eq!(replies.len(), 8);
     let text = |n: usize| replies[n]["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text(6), "page is too large");
+    assert_eq!(text(7), "page is too large");
     assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
     assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
     assert_eq!(replies[2]["result"]["isError"], true);

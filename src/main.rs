@@ -242,7 +242,8 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
     finish_tables(&transaction, &catalogue)?;
     transaction.commit()?;
     check_integrity(&connection)?;
-    connection.close().map_err(|(_, error)| error)?;
+    // Every statement is finished by here, so closing cannot fail; dropping closes it.
+    drop(connection);
     fs::rename(staging, target)?;
     Ok(
         json!({"documents":extraction.documents.len(),"source_files":sources.files.len(),"pages":page_count,"index":target}),
@@ -1346,15 +1347,23 @@ fn check_derived(root: &Path, connection: &Connection) -> Result<()> {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<std::result::Result<Vec<CitationRow>, _>>()?;
-            if stored != citation_rows(&metadata, &pages)? {
-                return Err(DERIVED_DIFFERS.into());
-            }
+            let derived = citation_rows(&metadata, &pages)?;
+            derived_matches(stored == derived)?;
         }
     }
     if schema >= 4 {
-        check_facts(root, connection)?;
+        return check_facts(root, connection);
     }
     Ok(())
+}
+
+/// The error for a stored paragraph, citation or fact that differs from what the pages give.
+fn derived_matches(same: bool) -> Result<()> {
+    if same {
+        Ok(())
+    } else {
+        Err(DERIVED_DIFFERS.into())
+    }
 }
 
 fn check_facts(root: &Path, connection: &Connection) -> Result<()> {
@@ -1424,9 +1433,12 @@ fn verify(root: &Path, connection: &Connection) -> Result<Value> {
             return Err("indexed page count differs".into());
         }
     }
-    if schema_version(connection)? >= 3 {
-        check_derived(root, connection)?;
-    }
+    let derived = if schema_version(connection)? >= 3 {
+        check_derived(root, connection)
+    } else {
+        Ok(())
+    };
+    derived?;
     let mut statement = connection.prepare("SELECT text,text_sha256 FROM pages")?;
     for row in statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

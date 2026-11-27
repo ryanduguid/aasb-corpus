@@ -1675,5 +1675,7 @@ This is a fabricated footnote the reader numbers."
         assert!(recovered_labels(&short, None).is_empty());
         assert!(recovered_labels(&page(2, "Fabricated short.\n"), Some(&readings)).is_empty());
         assert!(recovered_labels(&page(0, "Fabricated short.\n"), Some(&readings)).is_empty());
+        let front = page(1, "CONTENTS\n5 Fabricated short.\n");
+        assert!(recovered_labels(&front, Some(&readings)).is_empty());
     }
 }
