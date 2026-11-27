@@ -1,0 +1,45 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  # The CI workflow installs its Python tools from the hash-pinned
+  # requirements-ci.txt in the repository root; Dependabot bumps those pins.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    groups:
+      python:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    groups:
+      # init and analyze are separate dependencies to Dependabot but must
+      # move together: a job running one release against the other's config
+      # fails outright. Grouped so the pair can never arrive split.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+      github-actions:
+        patterns:
+          - "*"
