@@ -308,45 +308,13 @@ fn stem_is_a_search_flag_with_no_value_and_only_one_use() {
     }
 }
 
-/// README: 'No command uploads documents, calls a model provider or downloads
-/// content.' `strace -f` sees any network syscall, from any library or child
-/// process, on one run of every command. That proves these runs, not unexercised
-/// paths. Without strace the test skips with a message.
 #[cfg(target_os = "linux")]
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear strace run over every command; splitting it hides the sequence"
-)]
-fn every_command_makes_no_network_syscall() {
-    if Command::new("strace").arg("-V").output().is_err() {
-        eprintln!("skipped: strace is not installed");
-        return;
-    }
-    let fixture = Fixture::new();
-    let root = fixture.0.to_str().unwrap();
-    let sha = hash(&source("new"));
-    let log = fixture.0.join("no_network.strace");
-    let log = log.to_str().unwrap();
-    let session = mcp_lines(&tool_calls(&sha));
-    for (command, input) in [
-        (vec!["build", root], String::new()),
-        (vec!["stats", root], String::new()),
-        (vec!["catalogue", root], String::new()),
-        (vec!["search", root, "lease"], String::new()),
-        (vec!["paragraph", root, &sha, "26"], String::new()),
-        (vec!["page", root, &sha, "1"], String::new()),
-        (vec!["verify", root], String::new()),
-        (
-            vec!["verify-quote", root, &sha, "1", "Fabricated cobalt"],
-            String::new(),
-        ),
-        (vec!["mcp", root], session),
-    ] {
+fn assert_no_network_commands(log: &str, cases: &[(Vec<&str>, String, Option<usize>)]) {
+    for (command, input, mcp_replies) in cases {
         let mut child = Command::new("strace")
             .args(["-f", "-qq", "-e", "trace=%network,execve", "-o", log])
             .arg(env!("CARGO_BIN_EXE_aasb-corpus"))
-            .args(&command)
+            .args(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -364,14 +332,14 @@ fn every_command_makes_no_network_syscall() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        if command[0] == "mcp" {
+        if let Some(expected) = mcp_replies {
             // Every tool answered, so the trace covers each one.
             let replies: Vec<Value> = String::from_utf8(output.stdout)
                 .unwrap()
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
-            assert_eq!(replies.len(), 6);
+            assert_eq!(replies.len(), *expected);
             assert!(
                 replies
                     .iter()
@@ -389,6 +357,68 @@ fn every_command_makes_no_network_syscall() {
             "{trace}"
         );
     }
+}
+
+/// README: 'No command uploads documents, calls a model provider or downloads
+/// content.' `strace -f` sees any network syscall, from any library or child
+/// process, on one run of every command. That proves these runs, not unexercised
+/// paths. Without strace the test skips with a message.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_command_makes_no_network_syscall() {
+    if Command::new("strace").arg("-V").output().is_err() {
+        eprintln!("skipped: strace is not installed");
+        return;
+    }
+    let fixture = Fixture::new();
+    let root = fixture.0.to_str().unwrap();
+    let sha = hash(&source("new"));
+    let log = fixture.0.join("no_network.strace");
+    let log = log.to_str().unwrap();
+    let session = mcp_lines(&tool_calls(&sha));
+    assert_no_network_commands(
+        log,
+        &[
+            (vec!["build", root], String::new(), None),
+            (vec!["stats", root], String::new(), None),
+            (vec!["catalogue", root], String::new(), None),
+            (vec!["search", root, "lease"], String::new(), None),
+            (vec!["paragraph", root, &sha, "26"], String::new(), None),
+            (vec!["page", root, &sha, "1"], String::new(), None),
+            (vec!["verify", root], String::new(), None),
+            (
+                vec!["verify-quote", root, &sha, "1", "Fabricated cobalt"],
+                String::new(),
+                None,
+            ),
+            (vec!["mcp", root], session, Some(6)),
+        ],
+    );
+
+    let (s2, s2_sha) = s2_fixture();
+    let s2_root = s2.0.to_str().unwrap();
+    let checklist = s2.call("checklist", &[&s2_sha]);
+    let answer = gap_answer(&checklist, &s2_sha);
+    let answer_file = s2.0.join("answer.json");
+    fs::write(&answer_file, answer.to_string()).unwrap();
+    let s2_session = mcp_lines(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"list_aasb_s2_requirements","arguments":{"document_sha256":s2_sha}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"check_aasb_gap_analysis","arguments":{"document_sha256":s2_sha,"result":answer}}}),
+    ]);
+    assert_no_network_commands(
+        log,
+        &[
+            (vec!["checklist", s2_root, &s2_sha], String::new(), None),
+            (
+                vec!["gap-check", s2_root, &s2_sha, answer_file.to_str().unwrap()],
+                String::new(),
+                None,
+            ),
+            (vec!["mcp", s2_root], s2_session, Some(2)),
+        ],
+    );
 }
 
 /// One `tools/call` request per tool, ids 3 to 6, over the fabricated "new" PDF.
@@ -1166,11 +1196,16 @@ fn the_gap_check_command_and_tool_accept_a_complete_answer_and_refuse_the_rest()
             "verify_aasb_quote",
             json!({"document_sha256":sha,"quote":"x","page":4_294_967_296_u64}),
         ),
+        call(
+            9,
+            "list_aasb_s2_requirements",
+            json!({"document_sha256":sha}),
+        ),
     ];
     // A blank line between messages is skipped, not answered.
     let (replies, stderr) = mcp_input(&fixture.0, &format!("  \n{}", mcp_lines(&requests)));
     assert_eq!(stderr, "");
-    assert_eq!(replies.len(), 8);
+    assert_eq!(replies.len(), 9);
     let text = |n: usize| replies[n]["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(text(6), "page is too large");
     assert_eq!(text(7), "page is too large");
@@ -1179,9 +1214,16 @@ fn the_gap_check_command_and_tool_accept_a_complete_answer_and_refuse_the_rest()
     assert_eq!(replies[2]["result"]["isError"], true);
     assert_eq!(text(2), "arguments must be an object");
     assert_eq!(replies[3]["result"]["isError"], false, "{}", replies[3]);
-    assert_eq!(replies[4]["result"]["structuredContent"]["valid"], true);
+    assert_eq!(replies[4]["result"]["isError"], false, "{}", replies[4]);
+    assert_eq!(replies[4]["result"]["structuredContent"], valid);
+    let checked_text: Value = serde_json::from_str(text(4)).unwrap();
+    assert_eq!(checked_text, valid);
     assert_eq!(replies[5]["result"]["isError"], true);
     assert!(text(5).starts_with("the gap analysis does not match the checklist ("));
+    assert_eq!(replies[8]["result"]["isError"], false, "{}", replies[8]);
+    assert_eq!(replies[8]["result"]["structuredContent"], checklist);
+    let listed_text: Value = serde_json::from_str(text(8)).unwrap();
+    assert_eq!(listed_text, checklist);
 }
 
 #[test]

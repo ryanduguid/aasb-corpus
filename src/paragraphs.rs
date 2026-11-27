@@ -365,9 +365,36 @@ fn page_labels<'a>(lines: &[&'a str]) -> HashSet<&'a str> {
         .collect()
 }
 
-/// Where unlabelled paragraph text can start on a page: a line start, after a sentence end
-/// or after closing bold, with no label there. Each is the line index, the byte offset and
-/// the first words from it.
+/// True when `later` can continue a series during second-reader recovery: within two
+/// leading numbers in `current`'s series, or the first paragraph of a new prefixed series
+/// (such as `B1` after `105`, or `C1` after `B31`).
+fn recovery_series(current: Option<&str>, later: &str) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    let (Some((p1, n1)), Some((p2, n2))) = (parts(current), parts(later)) else {
+        return false;
+    };
+    if p1 == p2 {
+        n2 > n1 && n2[0].0.saturating_sub(n1[0].0) <= 2
+    } else {
+        !p2.is_empty() && n2 == [(1, None)]
+    }
+}
+
+/// Where unlabelled paragraph text can start on a page: a line start after a block or sentence
+/// end, after a sentence end inside a line, or after closing bold, with no label there.
+fn can_precede_paragraph(prev: &str) -> bool {
+    let end =
+        prev.trim_end_matches(|c: char| c.is_whitespace() || "*_\"”'’)]¹²³⁴⁵⁶⁷⁸⁹⁰".contains(c));
+    prev.trim().is_empty()
+        || footer(prev)
+        || reference_footnote(prev)
+        || heading(prev)
+        || valid_label(plain_start(prev).trim_end_matches(['*', '_']).trim())
+        || end.ends_with(['.', '!', '?', ':'])
+}
+
 fn paragraph_starts(lines: &[&str]) -> Vec<(usize, usize, Vec<String>)> {
     let mut starts = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -375,9 +402,12 @@ fn paragraph_starts(lines: &[&str]) -> Vec<(usize, usize, Vec<String>)> {
             continue;
         }
         let bold = line.match_indices("** ").map(|(at, _)| at + 3);
-        let offsets = std::iter::once(0)
+        let line_start = (index == 0 || can_precede_paragraph(lines[index - 1])).then_some(0);
+        let offsets: std::collections::BTreeSet<usize> = line_start
+            .into_iter()
             .chain(sentence_ends(line).map(|(at, _)| at))
-            .chain(bold);
+            .chain(bold)
+            .collect();
         for at in offsets {
             if !line[at..].trim().is_empty() && label_at(&line[at..]).is_none() {
                 starts.push((index, at, first_words(lines, index, at)));
@@ -432,8 +462,11 @@ fn recovered_labels<'a>(
         }
     }
     found.sort_unstable();
-    found.dedup_by_key(|(line, at, _)| (*line, *at));
     found
+        .chunk_by(|a, b| (a.0, a.1) == (b.0, b.1))
+        .filter(|group| group.len() == 1)
+        .map(|group| group[0])
+        .collect()
 }
 
 /// A footer, a reference footnote or a label alone on a line, as in the column of labels
@@ -443,7 +476,7 @@ fn not_text(line: &str, recovered: &[(usize, usize, &str)]) -> bool {
     footer(line) || reference_footnote(line) || recovered.iter().any(|(_, _, l)| *l == bare)
 }
 
-/// The recovered label of line `index` at byte `start`, when it continues `current`'s series.
+/// The recovered label of line `index` at byte `start`, when it continues or opens a series.
 fn restored_at<'a>(
     recovered: &[(usize, usize, &'a str)],
     index: usize,
@@ -452,14 +485,12 @@ fn restored_at<'a>(
 ) -> Option<&'a str> {
     recovered
         .iter()
-        .find(|(line, at, label)| {
-            *line == index && *at == start && current.is_none_or(|c| same_series(c, label))
-        })
+        .find(|(line, at, label)| *line == index && *at == start && recovery_series(current, label))
         .map(|(_, _, label)| *label)
 }
 
-/// The offset after `start` in line `index` of the next recovered label that continues
-/// `current`'s series. A page-foot footnote whose number extraction lost does not.
+/// The offset after `start` in line `index` of the next recovered label that continues or
+/// opens a series. A page-foot footnote whose number extraction lost does not.
 fn next_restored(
     recovered: &[(usize, usize, &str)],
     index: usize,
@@ -469,7 +500,7 @@ fn next_restored(
     recovered
         .iter()
         .filter(|(line, at, label)| {
-            *line == index && *at > start && current.is_none_or(|c| same_series(c, label))
+            *line == index && *at > start && recovery_series(current, label)
         })
         .map(|(_, at, _)| at - start)
         .min()
@@ -502,7 +533,8 @@ fn lines_with<'a>(
     for page in pages {
         let skip_page = front_matter(page);
         let texts: Vec<&str> = page.text.lines().collect();
-        let recovered = recovered_labels(page, readings);
+        let mut recovered = recovered_labels(page, readings);
+        recovered.retain(|(_, _, label)| !occurrences.contains_key(label));
         let (mut anchored_here, mut in_footnote) = (false, false);
         for (index, full) in texts.iter().copied().enumerate() {
             in_footnote =
@@ -513,7 +545,7 @@ fn lines_with<'a>(
                 let rest = &full[start..];
                 let restored = restored_at(&recovered, index, start, recent[0]).filter(|_| !skip);
                 // Table rows never split, so a row's label is always at its start.
-                let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip);
+                let row = row_anchor(full, recent[0], occurrences).filter(|_| !skip && start == 0);
                 if let Some(label) = label_at(rest).filter(|_| !skip).or(row).or(restored) {
                     recent = [Some(label), recent[0]];
                     anchored_here = true;
@@ -540,10 +572,8 @@ fn lines_with<'a>(
                     anchor: anchor.or(restored),
                     recovered: anchor.is_none() && restored.is_some(),
                 });
-                match split {
-                    Some(split) => start += split,
-                    None => break,
-                }
+                let Some(split) = split else { break };
+                start += split;
             }
         }
     }
@@ -1654,6 +1684,8 @@ This is a fabricated footnote the reader numbers."
         assert!(!follows("B1", "B"));
         assert!(!same_series("B", "B1"));
         assert!(!same_series("B1", "B"));
+        assert!(!recovery_series(Some("B"), "B1"));
+        assert!(!recovery_series(Some("B1"), "B"));
     }
 
     #[test]
@@ -1677,5 +1709,103 @@ This is a fabricated footnote the reader numbers."
         assert!(recovered_labels(&page(0, "Fabricated short.\n"), Some(&readings)).is_empty());
         let front = page(1, "CONTENTS\n5 Fabricated short.\n");
         assert!(recovered_labels(&front, Some(&readings)).is_empty());
+    }
+
+    #[test]
+    fn lost_label_after_bold_sentence_end_recovers_without_duplicate_offsets() {
+        let pages = [
+            page(
+                1,
+                "24 **Fabricated earlier sentence.** The fabricated lost paragraph starts right here.\n",
+            ),
+            page(2, "26 Fabricated next paragraph.\n"),
+        ];
+        let readings: Vec<String> = vec![
+            "24 Fabricated earlier sentence.\n25 The fabricated lost paragraph starts right here.\n".into(),
+            "26 Fabricated next paragraph.\n".into(),
+        ];
+        let found = recovered(&pages, &readings, "25");
+        assert_eq!(found["status"], "needs_review");
+        assert_eq!(found["candidates"][0]["next_paragraph"], "26");
+        assert_eq!(
+            found["candidates"][0]["fragments"][0]["text"],
+            "The fabricated lost paragraph starts right here."
+        );
+    }
+
+    #[test]
+    fn colliding_reading_labels_for_one_start_are_both_rejected() {
+        let pages = [page(
+            1,
+            "24 First paragraph.\n\nFabricated identical opening words appear here.\n",
+        )];
+        let readings: Vec<String> = vec![
+            "24 First paragraph.\n25 Fabricated identical opening words appear here.\n26 Fabricated identical opening words appear here.\n".into(),
+        ];
+        let labels: Vec<_> = index(&pages, Some(&readings))
+            .into_iter()
+            .map(|anchored| anchored.label)
+            .collect();
+        assert_eq!(labels, ["24"]);
+    }
+
+    #[test]
+    fn table_row_does_not_anchor_after_a_split_inside_the_row() {
+        let pages = [page(
+            1,
+            "2 Fabricated earlier text.\n|4|Fabricated first cell text is long **and** Fabricated lost paragraph three starts right here.|\n",
+        )];
+        let readings: Vec<String> = vec![
+            "2 Fabricated earlier text.\n3 Fabricated lost paragraph three starts right here.\n"
+                .into(),
+        ];
+        let labels: Vec<_> = index(&pages, Some(&readings))
+            .into_iter()
+            .map(|anchored| anchored.label)
+            .collect();
+        assert_eq!(labels, ["2", "3"]);
+    }
+
+    #[test]
+    fn lost_footnote_and_wrapped_numbers_do_not_anchor_whilst_new_series_recover() {
+        let pages = [
+            page(
+                1,
+                "3 Fabricated paragraph three applies here.\nThis is a fabricated footnote the reader numbers.\n",
+            ),
+            page(
+                2,
+                "4 Fabricated real paragraph four applies for the 2025\nAmendments to AASB fabricated text continue here.\n105 Fabricated last main paragraph.\n",
+            ),
+            page(
+                3,
+                "# Appendix B\n\nFabricated appendix opening paragraph text applies here.\nB2 Fabricated second appendix paragraph.\n",
+            ),
+            page(
+                4,
+                "B31 Fabricated last B paragraph.\n\nFabricated appendix C opening text applies here.\nC2 Fabricated second C paragraph.\n",
+            ),
+        ];
+        let readings: Vec<String> = vec![
+            "3 Fabricated paragraph three applies here.\n4 This is a fabricated footnote the reader numbers.\n".into(),
+            "4 Fabricated real paragraph four applies for the\n2025 Amendments to AASB fabricated text continue here.\n105 Fabricated last main paragraph.\n".into(),
+            "Appendix B\nB1 Fabricated appendix opening paragraph text applies here.\nB2 Fabricated second appendix paragraph.\n".into(),
+            "B31 Fabricated last B paragraph.\nC1 Fabricated appendix C opening text applies here.\nC2 Fabricated second C paragraph.\n".into(),
+        ];
+        let labels: Vec<_> = index(&pages, Some(&readings))
+            .into_iter()
+            .map(|anchored| anchored.label)
+            .collect();
+        assert_eq!(labels, ["3", "4", "105", "B1", "B2", "B31", "C1", "C2"]);
+        assert_eq!(recovered(&pages, &readings, "4")["status"], "found");
+        assert_eq!(recovered(&pages, &readings, "2025")["status"], "not_found");
+        assert_eq!(
+            recovered(&pages, &readings, "B1")["candidates"][0]["next_paragraph"],
+            "B2"
+        );
+        assert_eq!(
+            recovered(&pages, &readings, "C1")["candidates"][0]["next_paragraph"],
+            "C2"
+        );
     }
 }
