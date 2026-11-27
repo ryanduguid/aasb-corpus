@@ -126,7 +126,8 @@ jobs:
           python-version: "3.14"
 
       - name: Install Python test dependencies
-        run: python -m pip install --only-binary :all: pypdf coverage
+        run: >-
+          python -m pip install --only-binary :all: pypdf coverage
 
       - name: Run Python unit tests with 100% coverage
         run: |
