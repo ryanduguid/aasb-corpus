@@ -1647,4 +1647,38 @@ This is a fabricated footnote the reader numbers."
             .collect();
         assert_eq!(labels, ["5"]);
     }
+
+    #[test]
+    fn labels_that_do_not_parse_never_follow_or_continue_a_series() {
+        assert!(!follows("B", "B1"));
+        assert!(!follows("B1", "B"));
+        assert!(!same_series("B", "B1"));
+        assert!(!same_series("B1", "B"));
+    }
+
+    #[test]
+    fn a_marker_that_is_not_a_deletion_places_no_label_after_it() {
+        let line = "C1 [Revised by the AASB] AusC1.1 A fabricated effective date";
+        assert_eq!(after_deleted_marker(line), None);
+    }
+
+    #[test]
+    fn footers_are_not_paragraph_starts() {
+        let starts = paragraph_starts(&[
+            "AASB 16 STANDARD",
+            "5 Fabricated text one applies here today.",
+        ]);
+        assert!(!starts.is_empty());
+        assert!(starts.iter().all(|(line, _, _)| *line == 1));
+    }
+
+    #[test]
+    fn a_label_is_recovered_only_from_a_reading_of_this_page_with_enough_words() {
+        let short = page(1, "Fabricated short.\n");
+        let readings: Vec<String> = vec!["5 Fabricated short.\n".into()];
+        assert!(recovered_labels(&short, Some(&readings)).is_empty());
+        assert!(recovered_labels(&short, None).is_empty());
+        assert!(recovered_labels(&page(2, "Fabricated short.\n"), Some(&readings)).is_empty());
+        assert!(recovered_labels(&page(0, "Fabricated short.\n"), Some(&readings)).is_empty());
+    }
 }

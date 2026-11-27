@@ -241,10 +241,7 @@ fn build_staged(root: &Path, staging: &Path, target: &Path) -> Result<Value> {
     }
     finish_tables(&transaction, &catalogue)?;
     transaction.commit()?;
-    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        return Err(format!("SQLite integrity check: {integrity}").into());
-    }
+    check_integrity(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     fs::rename(staging, target)?;
     Ok(
@@ -260,14 +257,16 @@ fn finish_tables(connection: &Connection, catalogue: &Value) -> Result<()> {
         "paragraphs_fts",
         "paragraphs_stem",
     ] {
-        connection.execute(
+        let attempt = connection.execute(
             &format!("INSERT INTO {table}({table}) VALUES('rebuild')"),
             [],
-        )?;
-        connection.execute(
+        );
+        attempt?;
+        let attempt = connection.execute(
             &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
             [],
-        )?;
+        );
+        attempt?;
     }
     insert_facts(connection, catalogue)
 }
@@ -300,7 +299,7 @@ fn insert_pages(
         if page.page != expected {
             return Err("missing, duplicated or reordered page".into());
         }
-        connection.execute(
+        let attempt = connection.execute(
             "INSERT INTO pages(document_sha256,page,text,text_sha256,provenance,needs_review)
             VALUES (?1,?2,?3,?4,?5,?6)",
             params![
@@ -311,7 +310,8 @@ fn insert_pages(
                 page.provenance,
                 page.needs_review || page.text.trim().is_empty()
             ],
-        )?;
+        );
+        attempt?;
         pages.push(page);
         expected += 1;
     }
@@ -349,12 +349,13 @@ fn insert_paragraphs(
     pages: &[Page],
     readings: Option<&[String]>,
 ) -> Result<()> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "INSERT INTO paragraphs(document_sha256,ordinal,label,pdf_page,needs_review,candidate,text)
         VALUES (?1,?2,?3,?4,?5,?6,?7)",
-    )?;
+    );
+    let mut statement = attempt?;
     for (ordinal, label, page, review, candidate, text) in paragraph_rows(pages, readings)? {
-        statement.execute(params![
+        let attempt = statement.execute(params![
             sha,
             ordinal,
             label,
@@ -362,7 +363,8 @@ fn insert_paragraphs(
             review,
             candidate.to_string(),
             text
-        ])?;
+        ]);
+        attempt?;
     }
     Ok(())
 }
@@ -392,7 +394,7 @@ fn index_document(
         .map(|source| json!({"filename":source.filename,"source_url":source.source_url}))
         .collect();
     let metadata = metadata_for(catalogue, aliases);
-    connection.execute(
+    let attempt = connection.execute(
         "INSERT INTO documents VALUES (?1,?2,?3,?4,?5)",
         params![
             document.sha256,
@@ -401,7 +403,8 @@ fn index_document(
             serde_json::to_string(&metadata)?,
             document.pages_sha256
         ],
-    )?;
+    );
+    attempt?;
     let pages = insert_pages(connection, document, &page_path)?;
     let reading = second_reading(root, &document.sha256, pages.len())?;
     let readings = reading.as_ref().map(|(_, texts)| texts.as_slice());
@@ -417,10 +420,11 @@ fn insert_citations(
     metadata: &[Value],
     pages: &[Page],
 ) -> Result<()> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "INSERT INTO citations(citing_document_sha256,pdf_page,line,cited_standard,cited_label,kind)
         VALUES (?1,?2,?3,?4,?5,?6)",
-    )?;
+    );
+    let mut statement = attempt?;
     for (page, line, standard, label, kind) in citation_rows(metadata, pages)? {
         statement.execute(params![sha, page, line, standard, label, kind])?;
     }
@@ -496,10 +500,11 @@ fn derive_facts(connection: &Connection, catalogue: &Value) -> Result<Vec<(Strin
 /// Stores each document's validity and reporting tier.
 fn insert_facts(connection: &Connection, catalogue: &Value) -> Result<()> {
     for (sha, validity, tier) in derive_facts(connection, catalogue)? {
-        connection.execute(
+        let attempt = connection.execute(
             "INSERT INTO document_facts VALUES (?1,?2,?3)",
             params![sha, validity.to_string(), tier.to_string()],
-        )?;
+        );
+        attempt?;
     }
     Ok(())
 }
@@ -509,11 +514,12 @@ fn document_facts(connection: &Connection, sha: &str) -> Result<Option<(Value, V
     if schema_version(connection)? < 4 {
         return Ok(None);
     }
-    let (validity, tier): (String, String) = connection.query_row(
+    let attempt = connection.query_row(
         "SELECT validity,reporting_tier FROM document_facts WHERE document_sha256=?1",
         [sha],
         |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    );
+    let (validity, tier): (String, String) = attempt?;
     Ok(Some((
         serde_json::from_str(&validity)?,
         serde_json::from_str(&tier)?,
@@ -526,12 +532,13 @@ const DERIVED_BOUNDARY: &str = "validity restates the catalogue's period text ag
 /// grouped by the citing document's kind; at most 20 of each kind.
 fn cited_by(connection: &Connection, metadata: &[Value], label: &str) -> Result<Value> {
     let keys = standard_keys(metadata);
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT c.citing_document_sha256,c.pdf_page,c.line,c.kind,d.metadata FROM citations c
         JOIN documents d ON d.sha256=c.citing_document_sha256
         WHERE c.cited_standard IN (SELECT value FROM json_each(?1)) AND c.cited_label=?2
         ORDER BY c.kind,c.citing_document_sha256,c.pdf_page,c.line",
-    )?;
+    );
+    let mut statement = attempt?;
     let mut groups: BTreeMap<&str, Vec<Value>> = [
         "interpretation",
         "agenda_decision",
@@ -821,7 +828,7 @@ fn search_hits(
         AND (?2 IS NULL OR p.document_sha256 IN (SELECT value FROM json_each(?2)))
         ORDER BY bm25({table}),p.document_sha256,{position} LIMIT ?3 OFFSET ?4"
     ))?;
-    let rows = statement.query_map(
+    let attempt = statement.query_map(
         params![query, selected, options.limit + 1, options.offset],
         |row| {
             Ok((
@@ -834,7 +841,8 @@ fn search_hits(
                 row.get::<_, String>(6)?,
             ))
         },
-    )?;
+    );
+    let rows = attempt?;
     let mut hits = Vec::new();
     for row in rows {
         let (sha, page, snippet, detail, needs_review, aliases, metadata) = row?;
@@ -940,11 +948,12 @@ fn second_reading(
 
 fn aliases_metadata(connection: &Connection, sha: &str) -> Result<(String, String)> {
     valid_sha(sha)?;
-    Ok(connection.query_row(
+    let attempt = connection.query_row(
         "SELECT aliases,metadata FROM documents WHERE sha256=?1",
         [sha],
         |r| Ok((r.get(0)?, r.get(1)?)),
-    )?)
+    );
+    attempt.map_err(Into::into)
 }
 
 fn require_paragraph_table(connection: &Connection) -> Result<()> {
@@ -961,10 +970,11 @@ fn stored_paragraphs(
     label: Option<&str>,
     range: (i64, i64),
 ) -> Result<Vec<(i64, String, Value)>> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT ordinal,label,candidate FROM paragraphs WHERE document_sha256=?1
         AND (?2 IS NULL OR label=?2) AND ordinal BETWEEN ?3 AND ?4 ORDER BY ordinal",
-    )?;
+    );
+    let mut statement = attempt?;
     let rows = statement.query_map(params![sha, label, range.0, range.1], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
     })?;
@@ -1044,9 +1054,10 @@ fn candidates(connection: &Connection, sha: &str, label: &str) -> Result<(Value,
 }
 
 fn document_pages(connection: &Connection, sha: &str) -> Result<Vec<Page>> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT page,text,provenance,needs_review FROM pages WHERE document_sha256=?1 ORDER BY page",
-    )?;
+    );
+    let mut statement = attempt?;
     let pages = statement
         .query_map([sha], |r| {
             Ok(Page {
@@ -1072,11 +1083,12 @@ fn paragraph(
     if context.is_some() {
         require_paragraph_table(connection)?;
     }
-    let page_count: u32 = connection.query_row(
+    let attempt = connection.query_row(
         "SELECT page_count FROM documents WHERE sha256=?1",
         [sha],
         |r| r.get(0),
-    )?;
+    );
+    let page_count: u32 = attempt?;
     let (mut result, ordinals) = candidates(connection, sha, label)?;
     let sources: Value = serde_json::from_str(&aliases)?;
     // A reading of replaced or removed source bytes cannot confirm the indexed text.
@@ -1183,10 +1195,11 @@ fn graded_pages(
     number: Option<u32>,
     quote: &str,
 ) -> Result<Vec<Value>> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT page,text,text_sha256,provenance,needs_review FROM pages
         WHERE document_sha256=?1 AND (?2 IS NULL OR page=?2) ORDER BY page",
-    )?;
+    );
+    let mut statement = attempt?;
     let mut pages = Vec::new();
     for row in statement.query_map(params![sha, number], |r| {
         Ok((
@@ -1275,10 +1288,11 @@ fn check_paragraphs(
     pages: &[Page],
     readings: Option<&[String]>,
 ) -> Result<()> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT ordinal,label,pdf_page,needs_review,candidate,text FROM paragraphs
         WHERE document_sha256=?1 ORDER BY ordinal",
-    )?;
+    );
+    let mut statement = attempt?;
     let mut stored = Vec::new();
     for row in statement.query_map([sha], |r| {
         Ok((
@@ -1323,11 +1337,11 @@ fn check_derived(root: &Path, connection: &Connection) -> Result<()> {
         check_paragraphs(connection, &sha, &pages, readings)?;
         if schema >= 4 {
             let metadata: Vec<Value> = serde_json::from_str(&metadata)?;
-            let stored = connection
-                .prepare_cached(
-                    "SELECT pdf_page,line,cited_standard,cited_label,kind FROM citations
-                    WHERE citing_document_sha256=?1 ORDER BY id",
-                )?
+            let attempt = connection.prepare_cached(
+                "SELECT pdf_page,line,cited_standard,cited_label,kind FROM citations
+                WHERE citing_document_sha256=?1 ORDER BY id",
+            );
+            let stored = attempt?
                 .query_map([&sha], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
@@ -1345,10 +1359,11 @@ fn check_derived(root: &Path, connection: &Connection) -> Result<()> {
 
 fn check_facts(root: &Path, connection: &Connection) -> Result<()> {
     let catalogue: Value = read_json(&root.join("catalogue.json"))?;
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT document_sha256,validity,reporting_tier FROM document_facts
         ORDER BY document_sha256",
-    )?;
+    );
+    let mut statement = attempt?;
     let mut stored = Vec::new();
     for row in statement.query_map([], |r| {
         Ok((r.get(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
@@ -1367,11 +1382,18 @@ fn check_facts(root: &Path, connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn verify(root: &Path, connection: &Connection) -> Result<Value> {
+/// Fails unless SQLite's own consistency check of the index reads `ok`.
+fn check_integrity(connection: &Connection) -> Result<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        return Err("SQLite integrity check failed".into());
+    if integrity == "ok" {
+        Ok(())
+    } else {
+        Err(format!("SQLite integrity check failed: {integrity}").into())
     }
+}
+
+fn verify(root: &Path, connection: &Connection) -> Result<Value> {
+    check_integrity(connection)?;
     let sources: Sources = read_json(&root.join("source/manifest.json"))?;
     for source in sources.files {
         if file_hash(&root.join("source").join(filename(&source.filename)?))? != source.sha256 {
@@ -1392,11 +1414,12 @@ fn verify(root: &Path, connection: &Connection) -> Result<Value> {
         if file_hash(&root.join("extracted").join(&sha).join("pages.jsonl"))? != digest {
             return Err("extraction digest differs".into());
         }
-        let actual: u32 = connection.query_row(
+        let attempt = connection.query_row(
             "SELECT count(*) FROM pages WHERE document_sha256=?1",
             [&sha],
             |row| row.get(0),
-        )?;
+        );
+        let actual: u32 = attempt?;
         if actual != expected {
             return Err("indexed page count differs".into());
         }
@@ -1885,6 +1908,8 @@ mod tests {
         let two = format!("{reading}{{\"page\":2,\"text\":\"\"}}\n");
         write(&two, &|_| {});
         assert!(status().is_err());
+        write("{\"page\":2,\"text\":\"\"}\n", &|_| {});
+        assert!(status().is_err());
         write(reading, &|_| {});
         let original = fs::read(&source_manifest).unwrap();
         fs::write(&source_manifest, [original.as_slice(), b" "].concat()).unwrap();
@@ -2094,5 +2119,166 @@ mod tests {
         let options = parse(&["--standard", "AASB 16", "--limit", "3", "--offset", "2"]).unwrap();
         assert_eq!(options.limit, 3);
         assert_eq!(options.offset, 2);
+    }
+
+    const SOURCE: &[u8] =
+        b"Fabricated source bytes from the Croft Manor library for an index contract test";
+
+    /// The error of a build over `fixture()` after `change` rewrites its files.
+    fn build_error(change: impl FnOnce(&Path, &str)) -> String {
+        let root = fixture();
+        change(&root, &hash(SOURCE));
+        let error = build(&root).unwrap_err().to_string();
+        assert!(!root.join("index.sqlite3").exists());
+        error
+    }
+
+    /// Edits the JSON file at `path` and, for the source manifest, keeps the extraction's
+    /// record of its digest current.
+    fn edit_json(root: &Path, path: &str, change: impl FnOnce(&mut Value)) {
+        let mut value: Value = read_json(&root.join(path)).unwrap();
+        change(&mut value);
+        fs::write(root.join(path), value.to_string()).unwrap();
+        if path == "source/manifest.json" {
+            let digest = file_hash(&root.join(path)).unwrap();
+            edit_json(root, "extracted/manifest.json", |m| {
+                m["source_manifest_sha256"] = json!(digest);
+            });
+        }
+    }
+
+    #[test]
+    fn a_build_names_the_input_that_changed() {
+        let zeros = "0".repeat(64);
+        assert_eq!(
+            build_error(|root, _| edit_json(root, "extracted/manifest.json", |m| {
+                m["source_manifest_sha256"] = json!(zeros);
+            })),
+            "extraction failures or changed source manifest"
+        );
+        assert_eq!(
+            build_error(|root, _| edit_json(root, "extracted/manifest.json", |m| {
+                m["documents"] = json!([]);
+            })),
+            "extraction document coverage differs"
+        );
+        assert_eq!(
+            build_error(|root, _| fs::write(root.join("source/sample.pdf"), b"Changed").unwrap()),
+            "source changed: sample.pdf"
+        );
+        assert_eq!(
+            build_error(|root, _| edit_json(root, "source/manifest.json", |m| {
+                m["files"][0]["page_count"] = json!(2);
+            })),
+            "source and extraction page counts differ"
+        );
+        assert_eq!(
+            build_error(|root, _| edit_json(root, "extracted/manifest.json", |m| {
+                m["documents"][0]["pages_sha256"] = json!(zeros);
+            })),
+            "extracted pages changed"
+        );
+    }
+
+    #[test]
+    fn indexing_refuses_pages_that_are_missing_reordered_or_changed_meanwhile() {
+        let page = |number: u32| {
+            format!(
+                "{{\"page\":{number},\"text\":\"x\",\"provenance\":\"native\",\"needs_review\":false}}\n"
+            )
+        };
+        let rewrite = |root: &Path, sha: &str, pages: &str| {
+            fs::write(root.join("extracted").join(sha).join("pages.jsonl"), pages).unwrap();
+            edit_json(root, "extracted/manifest.json", |m| {
+                m["documents"][0]["pages_sha256"] = json!(hash(pages.as_bytes()));
+            });
+        };
+        assert_eq!(
+            build_error(|root, sha| rewrite(root, sha, &page(2))),
+            "missing, duplicated or reordered page"
+        );
+        assert_eq!(
+            build_error(|root, sha| rewrite(root, sha, &format!("{}{}", page(1), page(2)))),
+            "page coverage differs or extraction changed during indexing"
+        );
+    }
+
+    #[test]
+    fn a_damaged_index_fails_the_integrity_check() {
+        let root = fixture();
+        let path = root.join("scratch.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE t(a,b); CREATE INDEX i ON t(a); INSERT INTO t VALUES (1,2),(3,4);
+                PRAGMA writable_schema=ON;
+                UPDATE sqlite_master SET sql='CREATE INDEX i ON t(b)' WHERE name='i';",
+            )
+            .unwrap();
+        check_integrity(&connection).unwrap();
+        drop(connection);
+        let error = check_integrity(&Connection::open(&path).unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("SQLite integrity check failed: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn verify_names_the_stored_digest_or_count_that_differs() {
+        for (change, expected) in [
+            ("DELETE FROM pages", "indexed page count differs"),
+            (
+                "UPDATE pages SET text_sha256='0'",
+                "indexed text digest differs",
+            ),
+        ] {
+            let root = fixture();
+            build(&root).unwrap();
+            let writable = Connection::open(root.join("index.sqlite3")).unwrap();
+            writable
+                .execute_batch(&format!("PRAGMA writable_schema=ON; {change};"))
+                .unwrap();
+            assert_eq!(
+                verify(&root, &writable).unwrap_err().to_string(),
+                expected,
+                "{change}"
+            );
+        }
+        let root = fixture();
+        build(&root).unwrap();
+        let connection = open(&root).unwrap();
+        let sha = hash(SOURCE);
+        fs::write(root.join("extracted").join(&sha).join("pages.jsonl"), "{}").unwrap();
+        assert_eq!(
+            verify(&root, &connection).unwrap_err().to_string(),
+            "extraction digest differs"
+        );
+    }
+
+    #[test]
+    fn an_index_of_an_unknown_schema_is_not_opened() {
+        let root = fixture();
+        build(&root).unwrap();
+        Connection::open(root.join("index.sqlite3"))
+            .unwrap()
+            .execute_batch("PRAGMA user_version=9")
+            .unwrap();
+        assert_eq!(
+            open(&root).unwrap_err().to_string(),
+            "unsupported corpus schema"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_recorded_source_file_is_reported() {
+        let root = fixture();
+        let problems = source_problems(&root, &hash(SOURCE), &json!([])).unwrap();
+        assert_eq!(
+            problems,
+            ["No source PDF file is recorded for this document."]
+        );
     }
 }

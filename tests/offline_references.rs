@@ -1059,3 +1059,144 @@ fn verify_rederives_paragraph_columns_citations_and_document_facts() {
     }
     assert_eq!(fixture.call("verify", &[])["verified"], true);
 }
+
+/// A built snapshot of one fabricated AASB S2 PDF with 2 paragraphs that state a disclosure.
+fn s2_fixture() -> (Fixture, String) {
+    let fixture = Fixture::with(&[(
+        "s2",
+        "AASB S2",
+        "Fabricated S2",
+        "1 An entity shall disclose fabricated climate information.\n2 An entity shall also disclose fabricated targets.\n3 A fabricated note with no requirement.",
+    )]);
+    fixture.call("build", &[]);
+    let sha = hash(&source("s2"));
+    (fixture, sha)
+}
+
+/// A gap analysis that answers the first requirement as satisfied and the rest as not.
+fn gap_answer(checklist: &Value, sha: &str) -> Value {
+    let results: Vec<Value> = checklist["requirements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(n, requirement)| {
+            let id = requirement["id"].clone();
+            if n == 0 {
+                json!({"id":id,"status":"satisfied","quote":"Fabricated words","location":"page 1"})
+            } else {
+                json!({"id":id,"status":"not_satisfied","missing":"The fabricated element"})
+            }
+        })
+        .collect();
+    json!({"document_sha256":sha,"results":results})
+}
+
+#[test]
+fn the_gap_check_command_and_tool_accept_a_complete_answer_and_refuse_the_rest() {
+    let (fixture, sha) = s2_fixture();
+    let root = fixture.0.to_str().unwrap();
+    let checklist = fixture.call("checklist", &[&sha]);
+    let count = checklist["requirement_count"].as_u64().unwrap();
+    assert!(count >= 2, "{checklist}");
+    let answer = gap_answer(&checklist, &sha);
+    let file = fixture.0.join("answer.json");
+    fs::write(&file, answer.to_string()).unwrap();
+    let valid = fixture.call("gap-check", &[&sha, file.to_str().unwrap()]);
+    assert_eq!(valid["valid"], true);
+    assert_eq!(valid["requirement_count"], count);
+    assert_eq!(valid["satisfied"], 1);
+    assert_eq!(valid["not_satisfied"], count - 1);
+    fs::write(
+        &file,
+        json!({"document_sha256":sha,"results":[]}).to_string(),
+    )
+    .unwrap();
+    let refused = failure(&["gap-check", root, &sha, file.to_str().unwrap()]);
+    assert!(
+        refused.contains("does not match the checklist"),
+        "{refused}"
+    );
+    failure(&[
+        "gap-check",
+        root,
+        &sha,
+        fixture.0.join("absent.json").to_str().unwrap(),
+    ]);
+
+    let call = |id: u32, name: &str, arguments: Value| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":name,"arguments":arguments}})
+    };
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_aasb_stats"}}),
+        call(2, "get_aasb_stats", Value::Null),
+        call(3, "get_aasb_stats", json!("not an object")),
+        call(
+            4,
+            "verify_aasb_quote",
+            json!({"document_sha256":sha,"quote":"Fabricated"}),
+        ),
+        call(
+            5,
+            "check_aasb_gap_analysis",
+            json!({"document_sha256":sha,"result":answer}),
+        ),
+        call(
+            6,
+            "check_aasb_gap_analysis",
+            json!({"document_sha256":sha,"result":{"results":[]}}),
+        ),
+    ];
+    // A blank line between messages is skipped, not answered.
+    let (replies, stderr) = mcp_input(&fixture.0, &format!("  \n{}", mcp_lines(&requests)));
+    assert_eq!(stderr, "");
+    assert_eq!(replies.len(), 6);
+    let text = |n: usize| replies[n]["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+    assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
+    assert_eq!(replies[2]["result"]["isError"], true);
+    assert_eq!(text(2), "arguments must be an object");
+    assert_eq!(replies[3]["result"]["isError"], false, "{}", replies[3]);
+    assert_eq!(replies[4]["result"]["structuredContent"]["valid"], true);
+    assert_eq!(replies[5]["result"]["isError"], true);
+    assert!(text(5).starts_with("the gap analysis does not match the checklist ("));
+}
+
+#[test]
+fn the_command_line_refuses_missing_and_unknown_commands() {
+    let fixture = Fixture::new();
+    fixture.call("build", &[]);
+    let root = fixture.0.to_str().unwrap();
+    assert!(failure(&["build"]).starts_with("usage: aasb-corpus"));
+    assert_eq!(
+        failure(&["nonsense", root]).trim(),
+        "invalid command or arguments"
+    );
+    let new = hash(&source("new"));
+    let checked = fixture.call("verify-quote", &[&new, "Fabricated cobalt"]);
+    assert!(checked["grade"].is_string(), "{checked}");
+}
+
+#[test]
+fn a_citation_from_another_version_of_the_same_standard_is_not_listed() {
+    let fixture = Fixture::with(&[
+        (
+            "a",
+            "AASB 16",
+            "Fabricated older",
+            "26 Fabricated amber lease requirement.\n27 Next; see paragraph 26 of AASB 16.",
+        ),
+        (
+            "b",
+            "AASB 16",
+            "Fabricated newer",
+            "26 Fabricated cobalt lease requirement.\n27 Next fabricated paragraph.",
+        ),
+    ]);
+    fixture.call("build", &[]);
+    let (a, b) = (hash(&source("a")), hash(&source("b")));
+    let found = fixture.call("paragraph", &[&b, "26"]);
+    assert_eq!(found["candidate_count"], 1, "{found}");
+    assert!(!found.to_string().contains(&a), "{found}");
+}
