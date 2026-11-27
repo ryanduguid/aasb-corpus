@@ -2154,7 +2154,7 @@ This is a fabricated footnote the reader numbers."
             .into_iter()
             .map(|anchored| anchored.label)
             .collect();
-        assert_eq!(labels, ["2", "Aus2.1", "3", "4", "5"]);
+        assert_eq!(labels, ["2", "1", "Aus2.1", "3", "4", "5"]);
         assert_eq!(recovered(&pages, &readings, "4")["status"], "found");
     }
 }
