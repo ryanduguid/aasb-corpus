@@ -165,9 +165,10 @@ fn problems(checklist: &Value, result: &Value) -> Vec<String> {
 }
 
 fn stored_rows(connection: &Connection, sha: &str) -> Result<Vec<Row>> {
-    let mut statement = connection.prepare(
+    let attempt = connection.prepare(
         "SELECT label,pdf_page,needs_review,text,candidate FROM paragraphs WHERE document_sha256=?1 ORDER BY ordinal",
-    )?;
+    );
+    let mut statement = attempt?;
     let rows = statement
         .query_map([sha], |r| {
             Ok((

@@ -1,9 +1,13 @@
 import hashlib
 import io
 import json
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+import runpy
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import pypdf
 
@@ -87,6 +91,39 @@ class SecondReaderTests(unittest.TestCase):
             self.assertFalse((root / "second-reader").exists())
             self.assertFalse((root / "second-reader.partial").exists())
 
+    def test_a_file_repeated_under_another_name_is_read_once(self):
+        content = fabricated_pdf(1)
+        with tempfile.TemporaryDirectory() as folder:
+            root = snapshot(folder, [("sample.pdf", content, 1, None), ("copy.pdf", content, 1, None)])
+            self.assertEqual(second_reader.read(root), {"documents": 1, "failures": 0})
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_a_source_manifest_that_changes_during_reading_publishes_nothing(self):
+        content = fabricated_pdf(1)
+        with tempfile.TemporaryDirectory() as folder:
+            root = snapshot(folder, [("sample.pdf", content, 1, None)])
+            reader = pypdf.PdfReader
+
+            def changes_the_manifest(stream):
+                with (root / "source" / "manifest.json").open("a", encoding="utf-8") as manifest:
+                    manifest.write(" ")
+                return reader(stream)
+
+            with mock.patch.object(pypdf, "PdfReader", changes_the_manifest):
+                with self.assertRaisesRegex(ValueError, "manifest changed during reading"):
+                    second_reader.read(root)
+            self.assertFalse((root / "second-reader").exists())
+
+    def test_the_command_prints_its_counts_or_a_refusal_and_exits_non_zero(self):
+        script = str(Path(second_reader.__file__))
+        with tempfile.TemporaryDirectory() as folder:
+            root = snapshot(folder, [("sample.pdf", fabricated_pdf(1), 1, None)])
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", [script, str(root)]), redirect_stdout(out):
+                runpy.run_path(script, run_name="__main__")
+            self.assertEqual(json.loads(out.getvalue()), {"documents": 1, "failures": 0})
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", [script, str(root)]), redirect_stderr(err):
+                with self.assertRaises(SystemExit) as exit_:
+                    runpy.run_path(script, run_name="__main__")
+            self.assertEqual(exit_.exception.code, 1)
+            self.assertIn("already exists", err.getvalue())

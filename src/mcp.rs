@@ -284,8 +284,9 @@ fn other_tool(connection: &rusqlite::Connection, name: &str, call: &Value) -> Re
             let a = arguments(call, &["document_sha256"], &[], &[])?;
             checklist::checklist(connection, required(&a, "document_sha256")?)
         }
-        "check_aasb_gap_analysis" => gap_analysis(connection, call),
-        _ => Err(format!("unknown tool: {name}").into()),
+        // `reply` has already refused every name `tools()` does not list, so the last tool
+        // takes whatever remains.
+        _ => gap_analysis(connection, call),
     }
 }
 
