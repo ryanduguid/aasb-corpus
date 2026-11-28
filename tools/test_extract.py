@@ -118,11 +118,35 @@ class ExtractTests(unittest.TestCase):
             with self.subTest(label), tempfile.TemporaryDirectory() as folder:
                 root = snapshot(folder, [("a.pdf", content, 2 if "page" in label else 1)])
                 damage(root)
-                with self.assertRaisesRegex(ValueError, "1 documents failed"):
+                with self.assertRaisesRegex(ValueError, r"1 documents failed; retained extracted\.partial"):
                     self.run_extract(root, reading, ocr)
                 self.assertFalse((root / "extracted").exists())
                 receipt = json.loads((root / "extracted.partial" / "manifest.json").read_text(encoding="utf-8"))
                 self.assertIn(reason, receipt["failures"][0]["error"])
+
+    def test_invalid_page_counts_and_manifest_mutation_are_refused(self):
+        same = b"Fabricated PDF bytes"
+        for bad in (0, True, "1"):
+            with self.subTest(page_count=bad), tempfile.TemporaryDirectory() as folder:
+                root = snapshot(folder, [("a.pdf", same, bad)])
+                with self.assertRaisesRegex(ValueError, "page_count is not a positive integer"):
+                    self.run_extract(root, native(("one", False)))
+                self.assertFalse((root / "extracted.partial").exists())
+        with tempfile.TemporaryDirectory() as folder:
+            root = snapshot(folder, [("a.pdf", same, 1), ("b.pdf", same, 2)])
+            with self.assertRaisesRegex(ValueError, "page_count conflicts for one SHA-256"):
+                self.run_extract(root, native(("one", False)))
+            self.assertFalse((root / "extracted.partial").exists())
+        with tempfile.TemporaryDirectory() as folder:
+            root = snapshot(folder, [("a.pdf", same, 1)])
+
+            def changes_manifest(_path):
+                (root / "source" / "manifest.json").write_text('{"files":[]}', encoding="utf-8")
+                return native(("one", False))
+
+            with self.assertRaisesRegex(ValueError, "Source manifest changed during extraction"):
+                self.run_extract(root, changes_manifest)
+            self.assertFalse((root / "extracted").exists())
 
     def test_the_command_prints_a_refusal_and_exits_non_zero(self):
         with tempfile.TemporaryDirectory() as folder:

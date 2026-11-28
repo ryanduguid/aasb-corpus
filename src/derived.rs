@@ -16,7 +16,14 @@ pub(crate) struct Citation {
 /// Strips markup and trailing punctuation from one word.
 fn clean(word: &str) -> &str {
     word.trim_matches(['*', '_'])
-        .trim_end_matches([',', ';', ':', '.', ')', '*', '_'])
+        .trim_end_matches([',', ';', ':', '.', ')', ']', '*', '_'])
+}
+
+/// A parenthesised subparagraph tail such as `(c)` or `(ii)` after `clean` stripped `)`.
+fn subparagraph(word: &str) -> bool {
+    word.strip_prefix('(').is_some_and(|rest| {
+        (1..=3).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_lowercase())
+    })
 }
 
 /// `AASB N` when `words` start with it; N is digits or `S` and digits.
@@ -34,25 +41,33 @@ fn standard(words: &[(usize, &str)]) -> Option<String> {
 }
 
 /// The labels listed from the start of `words`, and how many words they use. A range cites
-/// its endpoints only; a lettered subparagraph such as `35(a)` cites its parent.
+/// its endpoints only; a lettered subparagraph such as `35(a)` or `35(a)–(c)` cites its parent.
 fn labels<'a>(words: &[(usize, &'a str)]) -> (Vec<&'a str>, usize) {
     let mut labels = Vec::new();
     let mut used = 0;
     for (_, word) in words {
         let word = clean(word);
-        if !matches!(word, "and" | "or" | "to") {
-            let parts: Vec<_> = word
-                .split(['–', '-'])
-                .map(|part| part.split('(').next().unwrap_or_default())
-                .collect();
-            if !parts
-                .iter()
-                .all(|part| crate::paragraphs::valid_label(part))
-            {
+        if matches!(word, "and" | "or" | "to") || (!labels.is_empty() && subparagraph(word)) {
+            used += 1;
+            continue;
+        }
+        let mut token_labels = Vec::new();
+        let mut valid = true;
+        for (index, part) in word.split(['–', '-']).enumerate() {
+            if index > 0 && subparagraph(part) {
+                continue;
+            }
+            let base = part.split('(').next().unwrap_or_default();
+            if !crate::paragraphs::valid_label(base) {
+                valid = false;
                 break;
             }
-            labels.extend(parts);
+            token_labels.push(base);
         }
+        if !valid {
+            break;
+        }
+        labels.extend(token_labels);
         used += 1;
     }
     (labels, used)
@@ -69,7 +84,9 @@ pub(crate) fn citations(pages: &[Page]) -> Vec<Citation> {
             .flat_map(|(index, line)| line.split_whitespace().map(move |w| (index + 1, w)))
             .collect();
         for (start, (line, word)) in words.iter().enumerate() {
-            let word = clean(word).to_ascii_lowercase();
+            let word = clean(word)
+                .trim_start_matches(['(', '['])
+                .to_ascii_lowercase();
             if !matches!(word.as_str(), "paragraph" | "paragraphs") {
                 continue;
             }
@@ -167,6 +184,18 @@ const MONTHS: [&str; 12] = [
     "December",
 ];
 
+/// Number of calendar days in `month` (1..=12) of `year`.
+fn days_in_month(year: u32, month: usize) -> u32 {
+    match month {
+        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
 /// The ISO date written as `1 January 2027` straight after `marker`.
 fn date_after(text: &str, marker: &str) -> Option<String> {
     let (_, rest) = text.split_once(marker)?;
@@ -175,8 +204,7 @@ fn date_after(text: &str, marker: &str) -> Option<String> {
     let name = words.next()?;
     let month = MONTHS.iter().position(|m| *m == name)? + 1;
     let year: u32 = clean(words.next()?).parse().ok()?;
-    (1..=31)
-        .contains(&day)
+    ((1000..=9999).contains(&year) && (1..=days_in_month(year, month)).contains(&day))
         .then(|| format!("{year:04}-{month:02}-{day:02}"))
 }
 
@@ -193,7 +221,13 @@ struct Periods {
 
 /// Reads the mandatory periods; an early-application sentence is optional and not read.
 fn periods(text: &str) -> Periods {
-    let text = text.split("Early application").next().unwrap_or_default();
+    let text = text
+        .split("Early application")
+        .next()
+        .unwrap_or_default()
+        .split("Earlier application")
+        .next()
+        .unwrap_or_default();
     // 'but before' bounds whichever clause it follows: period beginnings or period ends.
     let ends_clause = text.find("but before ").is_some_and(|at| {
         text[..at].rfind("end on or after ") > text[..at].rfind("beginning on or after ")
@@ -476,5 +510,47 @@ mod tests {
         );
         assert_eq!(undated["status"], Value::Null);
         assert_eq!(undated["applies_from"], "2027-01-01");
+    }
+
+    #[test]
+    fn citations_read_bracketed_clauses_and_subparagraph_ranges() {
+        assert_eq!(
+            cited("(paragraph 26 of AASB 16) and [paragraphs 27 and 28 of AASB 16]"),
+            pairs(&[("AASB 16", "26"), ("AASB 16", "27"), ("AASB 16", "28")])
+        );
+        assert_eq!(
+            cited("paragraphs 26, 27(a)–(c) and 35(a) and (b) of AASB S2"),
+            pairs(&[("AASB S2", "26"), ("AASB S2", "27"), ("AASB S2", "35")])
+        );
+        assert!(cited("paragraph (a) of AASB 16").is_empty());
+        assert!(cited("paragraph (1) of AASB 16").is_empty());
+    }
+
+    #[test]
+    fn invalid_calendar_dates_are_refused_and_earlier_application_is_ignored() {
+        for bad in [
+            "beginning on or after 31 February 2027",
+            "beginning on or after 29 February 2026",
+            "beginning on or after 29 February 1900",
+            "beginning on or after 31 April 2027",
+            "beginning on or after 1 January 25",
+        ] {
+            let found = status(Some(bad));
+            assert_eq!(found["applies_from"], Value::Null, "{bad}");
+            assert_eq!(found["status"], Value::Null, "{bad}");
+        }
+        assert_eq!(
+            status(Some("beginning on or after 29 February 2024"))["applies_from"],
+            "2024-02-29"
+        );
+        assert_eq!(
+            status(Some("beginning on or after 29 February 2000"))["applies_from"],
+            "2000-02-29"
+        );
+        let earlier = status(Some(
+            "Applies to periods beginning on or after 1 July 2026. Earlier application is permitted for periods beginning on or after 1 January 2025.",
+        ));
+        assert_eq!(earlier["status"], "current");
+        assert_eq!(earlier["applies_from"], "2026-07-01");
     }
 }
