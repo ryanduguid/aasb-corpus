@@ -39,19 +39,21 @@ fn disclosures(text: &str) -> usize {
     let words: Vec<String> = text
         .replace(['*', '_'], "")
         .split_whitespace()
-        .map(|w| {
-            w.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_ascii_lowercase()
-        })
-        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
         .collect();
+    fn start(w: &str) -> &str {
+        w.trim_start_matches(|c: char| !c.is_alphanumeric())
+    }
+    fn end(w: &str) -> &str {
+        w.trim_end_matches(|c: char| !c.is_alphanumeric())
+    }
     words
         .windows(2)
-        .filter(|w| *w == ["shall", "disclose"])
+        .filter(|w| start(&w[0]) == "shall" && end(&w[1]) == "disclose")
         .count()
         + words
             .windows(3)
-            .filter(|w| *w == ["shall", "also", "disclose"])
+            .filter(|w| start(&w[0]) == "shall" && w[1] == "also" && end(&w[2]) == "disclose")
             .count()
 }
 
@@ -482,12 +484,15 @@ mod tests {
     #[test]
     fn disclosures_require_whole_words_not_substrings() {
         assert_eq!(disclosures("An entity **shall\ndisclose**: risks."), 1);
+        assert_eq!(disclosures("An entity (shall disclose) risks."), 1);
         assert_eq!(
             disclosures("An entity shall also disclose, if material."),
             1
         );
         assert_eq!(disclosures("Marshall discloses fabricated notes."), 0);
         assert_eq!(disclosures("An entity shall disclosed nothing."), 0);
+        assert_eq!(disclosures("An entity shall. Disclose risks."), 0);
+        assert_eq!(disclosures("An entity shall also, disclose risks."), 0);
     }
 
     #[test]
