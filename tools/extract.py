@@ -39,7 +39,7 @@ def extract(root):
     counts = {}
     for entry in manifest["files"]:
         count = entry.get("page_count")
-        if type(count) is not int or count < 1:
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError(f"Download manifest page_count is not a positive integer: {entry.get('filename')}")
         if counts.setdefault(entry["sha256"], count) != count:
             raise ValueError(f"Download manifest page_count conflicts for one SHA-256: {entry.get('filename')}")
